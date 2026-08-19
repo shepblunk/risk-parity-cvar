@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.ipynb_checkpoints/
+.pytest_cache/
+*.egg-info/
+
+# Raw/processed data caches -- regenerable via scripts/run_pipeline.py,
+# no reason to bloat the repo or commit stale market data.
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# LaTeX build artifacts (docs/notes.tex) -- keep the compiled notes.pdf
+# (viewable without a LaTeX toolchain) but not the intermediate files.
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.fls
+docs/*.fdb_latexmk
+docs/*.synctex.gz

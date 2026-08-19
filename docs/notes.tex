@@ -1,0 +1,1205 @@
+% ============================================================================
+% docs/notes.tex -- Living project notebook.
+%
+% MAINTENANCE RULES (see also CLAUDE.md, section "Project notebook"):
+%   - This file is updated incrementally as the project progresses, in the
+%     same change as the code it documents. It is not a one-off writeup.
+%   - Every module implemented in riskparity/ should get its formulas,
+%     reasoning, and a short annotated code excerpt added to the matching
+%     subsection of Section "Implementation Log" -- do not leave a module
+%     documented only in code comments.
+%   - Figures are pulled from results/figures/ via \IfFileExists guards, so
+%     the document always compiles even before the pipeline has produced
+%     any output; once a figure exists on disk it appears automatically on
+%     the next compile.
+%   - Keep derivations self-contained: a reader should be able to follow the
+%     math here without cross-referencing the paper unless it's explicitly
+%     cited for a result that isn't re-derived.
+%   - Compile with: latexmk -pdf docs/notes.tex   (or pdflatex, run twice
+%     for the table of contents / references to resolve).
+% ============================================================================
+
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{todonotes}
+
+\hypersetup{colorlinks=true, linkcolor=blue!50!black, citecolor=blue!50!black, urlcolor=blue!50!black}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+
+\lstdefinestyle{python}{
+    language=Python,
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue!60!black}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{OliveGreen},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    showstringspaces=false,
+    breaklines=true,
+    frame=single,
+    tabsize=4,
+}
+\lstset{style=python}
+
+\newcommand{\Var}{\mathrm{VaR}}
+\newcommand{\CVar}{\mathrm{CVaR}}
+
+\title{Risk Parity / ERC vs.\ Component CVaR Parity\\[4pt]\large Project Notebook: Finance Concepts, Mathematics, and Implementation}
+\author{Quant Risk Projects}
+\date{Started \today\ --- updated continuously alongside \texttt{riskparity/}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This notebook is the running mathematical and financial companion to the
+\texttt{risk-parity-cvar} codebase. It collects, in one place and in
+increasing detail as the project advances: the finance concepts involved
+(risk parity, tail risk, diversification), the mathematics behind each
+risk measure and solver (with derivations, not just citations), the
+corresponding Python implementation with commentary, and the empirical
+results once they exist. See \texttt{README.md} for the project pitch and
+\texttt{PROJECT\_BRIEF.md} for scope/design rationale; this document is
+where the \emph{content} -- the actual finance and math -- lives.
+\end{abstract}
+
+\tableofcontents
+
+% ============================================================================
+\section{Motivation}
+% ============================================================================
+
+Volatility-based risk parity treats risk as symmetric and approximately
+Gaussian: an asset's contribution to portfolio risk depends only on its
+variance and covariances with other assets. In practice, tail risk is not
+proportional to variance -- some assets have fatter left tails than their
+volatility alone suggests (e.g.\ equities vs.\ long-duration government
+bonds). The central question of this project:
+
+\begin{quote}
+\itshape Does equalizing \textbf{Component CVaR} contributions instead of
+volatility contributions produce a materially different, more
+tail-robust portfolio -- and if so, when does it matter most?
+\end{quote}
+
+Answering this requires two parity engines built on the same mathematical
+principle (Euler risk decomposition, Section~\ref{sec:euler}) but applied
+to two different risk measures: one with a closed form (volatility,
+Section~\ref{sec:vol-erc}) and one without (CVaR,
+Section~\ref{sec:cvar-parity}).
+
+% ============================================================================
+\section{Mathematical Foundations: Euler Risk Decomposition}
+\label{sec:euler}
+% ============================================================================
+
+\subsection{Positive homogeneity}
+
+\begin{definition}[Positive homogeneity of degree 1]
+A function $\rho : \mathbb{R}^n \to \mathbb{R}$ is \textbf{positively
+homogeneous of degree 1} if
+\[
+\rho(t\, w) = t \, \rho(w) \qquad \text{for all } t > 0,\ w \in \mathbb{R}^n .
+\]
+\end{definition}
+
+Portfolio volatility and portfolio CVaR both have this property: if every
+position in the portfolio is scaled by $t>0$ (before renormalizing weights
+to sum to 1, or simply thinking of $w$ as dollar exposures), the risk
+measure scales by exactly $t$. This is the property that makes an
+\emph{exact} risk decomposition possible.
+
+\begin{theorem}[Euler's homogeneous function theorem]
+If $\rho$ is positively homogeneous of degree 1 and differentiable, then
+\[
+\rho(w) = \sum_{i=1}^n w_i \, \frac{\partial \rho}{\partial w_i}(w).
+\]
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Differentiate both sides of $\rho(tw) = t\rho(w)$ with respect to $t$:
+\[
+\sum_i w_i \, \frac{\partial \rho}{\partial w_i}(tw) = \rho(w).
+\]
+Setting $t = 1$ gives the result.
+\end{proof}
+
+\subsection{Risk contributions}
+
+\begin{definition}[Marginal, absolute, and percentage risk contribution]
+\label{def:rc}
+For a risk measure $\rho(w)$ satisfying the conditions above:
+\[
+\text{MRC}_i = \frac{\partial \rho}{\partial w_i}(w), \qquad
+\text{RC}_i = w_i \cdot \text{MRC}_i, \qquad
+\text{\%RC}_i = \frac{\text{RC}_i}{\rho(w)} .
+\]
+By Euler's theorem, $\sum_i \text{RC}_i = \rho(w)$ exactly, and
+$\sum_i \text{\%RC}_i = 1$. This holds for \emph{any} weights $w$, not
+just at an optimum -- it is an identity, not a property of a particular
+portfolio.
+\end{definition}
+
+\begin{definition}[Risk Parity / Equal Risk Contribution (ERC)]
+Given risk budgets $b_i \geq 0$ with $\sum_i b_i = 1$ (defaulting to
+$b_i = 1/n$), a portfolio $w$ is \textbf{risk-parity} (or budget-balanced)
+with respect to $\rho$ if
+\[
+\text{RC}_i(w) = b_i \cdot \rho(w) \qquad \text{for all } i.
+\]
+\end{definition}
+
+This identity and definition are the backbone of the entire project: both
+the volatility engine and the CVaR engine implement a solver that searches
+for weights satisfying this condition, for two different choices of
+$\rho$. It is verified directly by
+\texttt{tests/test\_contributions.py} (see
+Section~\ref{sec:vol-erc-impl}) -- if a code change ever breaks
+$\sum_i \text{RC}_i = \rho(w)$, that is a correctness bug, not something to
+paper over with a looser tolerance.
+
+% ============================================================================
+\section{Volatility-Based Risk Parity (Vol-ERC)}
+\label{sec:vol-erc}
+% ============================================================================
+
+\subsection{Portfolio volatility and its closed-form gradient}
+
+Let $\Sigma$ be the (annualized) covariance matrix of asset returns and
+$w$ the portfolio weights. Portfolio volatility is
+\[
+\sigma_p(w) = \sqrt{w^\top \Sigma w},
+\]
+which is positively homogeneous of degree 1 (scaling $w$ by $t$ scales
+$\sigma_p$ by $t$, since the quadratic form scales by $t^2$ and the square
+root brings it back to $t$). Its gradient is closed-form:
+\[
+\frac{\partial \sigma_p}{\partial w_i} = \frac{(\Sigma w)_i}{\sigma_p(w)}
+\quad\Longrightarrow\quad
+\text{MRC}_i = \frac{(\Sigma w)_i}{\sigma_p(w)}, \qquad
+\text{RC}_i = \frac{w_i (\Sigma w)_i}{\sigma_p(w)} .
+\]
+This is the reason volatility-ERC is analytically tractable: no
+simulation or scenario set is required, only $\Sigma$.
+
+\subsection{The ERC optimization problem}
+
+The direct formulation --- minimize the dispersion of risk contributions
+---
+\[
+\min_{w \geq 0,\ \mathbf{1}^\top w = 1} \ \sum_{i,j} \big(\text{RC}_i(w) - \text{RC}_j(w)\big)^2
+\]
+is not convex in general. Maillard, Roncalli \& Teïletche (2010) show
+that for equal budgets $b_i = 1/n$, the ERC solution can instead be
+obtained from the convex proxy problem
+\[
+\min_{w \geq 0} \ \tfrac{1}{2} w^\top \Sigma w - \sum_i b_i \ln w_i,
+\]
+which is a log-barrier-regularized quadratic form: convex (the Hessian of
+$-\sum_i b_i \ln w_i$ is positive definite on the positive orthant, and
+$\tfrac12 w^\top \Sigma w$ is convex since $\Sigma \succeq 0$), hence has
+a unique minimizer up to scale. Solving it and then renormalizing
+$w \leftarrow w / \mathbf{1}^\top w$ yields the ERC portfolio. This convex
+reformulation is what makes volatility-ERC the ``easy'' side of the
+project, in contrast to CVaR-parity (Section~\ref{sec:cvar-parity}).
+
+\subsection{Two-asset closed form (sanity check case)}
+\label{sec:two-asset}
+
+For two uncorrelated assets with volatilities $\sigma_1, \sigma_2$, the
+ERC solution has a simple closed form:
+\[
+w_i \propto \frac{1}{\sigma_i} \quad\Longrightarrow\quad
+w_1 = \frac{1/\sigma_1}{1/\sigma_1 + 1/\sigma_2}, \qquad
+w_2 = \frac{1/\sigma_2}{1/\sigma_1 + 1/\sigma_2}.
+\]
+This is the case used in
+\texttt{tests/test\_contributions.py::test\_volatility\_contributions\_two\_uncorrelated\_assets\_known\_case}
+and in \texttt{tests/test\_erc.py} to validate the general solver against
+a known answer.
+
+\subsection{Implementation}
+\label{sec:vol-erc-impl}
+
+\texttt{riskparity/risk/contributions.py::volatility\_risk\_contributions}
+is the first (and, so far, only) fully implemented function in the
+codebase, and serves as the reference pattern for everything else:
+
+\begin{lstlisting}
+def volatility_risk_contributions(weights: np.ndarray, cov: np.ndarray) -> RiskContributions:
+    weights = np.asarray(weights, dtype=float)
+    cov = np.asarray(cov, dtype=float)
+
+    portfolio_variance = weights @ cov @ weights
+    sigma_p = np.sqrt(portfolio_variance)
+
+    marginal = (cov @ weights) / sigma_p
+    contribution = weights * marginal
+    pct_contribution = contribution / sigma_p
+
+    return RiskContributions(
+        total_risk=float(sigma_p),
+        marginal=marginal,
+        contribution=contribution,
+        pct_contribution=pct_contribution,
+    )
+\end{lstlisting}
+
+This is a direct transcription of the formulas above: \texttt{marginal}
+is $\text{MRC}_i$, \texttt{contribution} is $\text{RC}_i$, and
+\texttt{pct\_contribution} is $\%\text{RC}_i$. It is validated by three
+tests in \texttt{tests/test\_contributions.py}:
+\begin{itemize}
+    \item \textbf{Sum invariant}: $\sum_i \text{RC}_i = \sigma_p(w)$ for
+    random valid weights and a random PSD covariance matrix -- Euler's
+    theorem holds numerically to \texttt{1e-8} relative tolerance.
+    \item \textbf{Known two-asset case}: at the closed-form ERC weights
+    of Section~\ref{sec:two-asset}, contributions are equal.
+    \item \textbf{Concentrated portfolio edge case}: a 100\%-in-one-asset
+    portfolio has all risk contribution on that asset and zero elsewhere.
+\end{itemize}
+
+\texttt{riskparity/optimization/erc.py::solve\_erc} (not yet implemented)
+will wrap the log-barrier reformulation above to actually produce ERC
+weights from a covariance matrix.
+
+% ============================================================================
+\section{Tail Risk Measures: VaR and CVaR}
+\label{sec:var-cvar}
+% ============================================================================
+
+\subsection{Definitions}
+
+For a portfolio return series $R$ (realized or simulated) and a
+confidence level $\alpha$ (e.g.\ $0.975$), expressed so that both
+quantities are positive loss numbers:
+\[
+\Var_\alpha(R) = -\,Q_{1-\alpha}(R), \qquad
+\CVar_\alpha(R) = -\,\mathbb{E}\big[R \mid R \leq -\Var_\alpha(R)\big],
+\]
+where $Q_{1-\alpha}$ is the $(1-\alpha)$-quantile of the return
+distribution. $\CVar_\alpha$ (also called Expected Shortfall) is the
+average loss \emph{in the tail beyond} $\Var_\alpha$, and is a coherent
+risk measure (subadditive, unlike VaR).
+
+\subsection{Historical (non-parametric) estimator}
+
+Directly from the empirical distribution of portfolio returns over the
+lookback window: sort the realized/simulated returns, take the
+$(1-\alpha)$ empirical quantile for $\Var_\alpha$, and average everything
+at or below it for $\CVar_\alpha$. Simple and assumption-light, but noisy
+with limited history -- with $T=500$ observations and $\alpha = 0.975$,
+the CVaR estimate averages over only $\approx 12$--$13$ tail
+observations.
+
+\subsection{Cornish--Fisher (semi-parametric) estimator}
+
+Adjusts the Gaussian quantile for sample skewness $S$ and excess kurtosis
+$K$ via the Cornish--Fisher expansion of the standard normal quantile
+$z_\alpha$:
+\[
+z_\alpha^{CF} = z_\alpha + \frac{1}{6}(z_\alpha^2 - 1)S
++ \frac{1}{24}(z_\alpha^3 - 3z_\alpha)K
+- \frac{1}{36}(2z_\alpha^3 - 5 z_\alpha)S^2,
+\]
+then $\Var_\alpha \approx -(\mu + \sigma \, z_\alpha^{CF})$. More stable
+than the historical estimator with limited data, but can misbehave for
+extreme skew/kurtosis -- worth a direct comparison plot against the
+historical estimator once both are implemented
+(\texttt{riskparity/risk/tail\_risk.py}).
+
+\subsection{Rockafellar--Uryasev (2000): CVaR as a convex program}
+
+A key result used to justify \emph{minimizing} CVaR (distinct from
+\emph{equalizing CVaR contributions}, which is the harder problem tackled
+in Section~\ref{sec:cvar-parity}): for scenario returns $r_1, \dots, r_T$,
+\[
+\CVar_\alpha(w) = \min_{c \in \mathbb{R}} \left[ c + \frac{1}{(1-\alpha) T} \sum_{t=1}^T \big(-w^\top r_t - c\big)^+ \right],
+\]
+where $(x)^+ = \max(x, 0)$. This is convex (in fact LP-representable via
+an auxiliary variable per scenario) and lets CVaR be minimized with
+standard convex solvers. It does \emph{not} directly solve the
+risk-parity problem -- equalizing contributions is a different, harder
+objective (Section~\ref{sec:cvar-parity}).
+
+% ============================================================================
+\section{Component CVaR and CVaR-Parity}
+\label{sec:cvar-parity}
+% ============================================================================
+
+\subsection{Why CVaR has no closed form in $(w, \Sigma)$}
+
+Unlike volatility, CVaR is not a smooth quadratic function of $w$ under a
+covariance matrix -- it depends on the shape of the tail of the portfolio
+return distribution, which cannot in general be summarized by
+second-moment information alone. It must be estimated from a scenario set
+(historical returns, or simulated draws from a fitted model).
+
+\subsection{Scenario-based marginal CVaR contribution}
+
+Given scenario asset returns $r_{i,t}$ and portfolio returns
+$R_t = w^\top r_t$, let $T_\alpha = \{t : R_t \leq -\Var_\alpha(R)\}$ be
+the set of tail scenarios. The scenario-based estimator of the marginal
+CVaR contribution of asset $i$ (Boudt, Peterson \& Carl, 2013, in spirit)
+is
+\[
+\text{MRC}_i \approx -\frac{1}{|T_\alpha|} \sum_{t \in T_\alpha} r_{i,t},
+\qquad
+\text{RC}_i = w_i \cdot \text{MRC}_i,
+\]
+i.e.\ the (sign-flipped) average return of asset $i$ specifically during
+the scenarios that make up the portfolio's tail. By construction
+$\sum_i \text{RC}_i \approx \CVar_\alpha(w)$ -- \emph{approximately}
+exact, unlike the volatility case, because it relies on the scenario tail
+set being exactly the same set that defines $\CVar_\alpha(w)$ itself. The
+residual numerical error should be measured and reported (planned test in
+\texttt{tests/test\_contributions.py}, currently a TODO) rather than
+assumed to be negligible.
+
+\subsection{Non-convexity of CVaR-parity}
+
+Minimizing total CVaR is convex (Section~\ref{sec:var-cvar}), but
+\emph{equalizing Component CVaR contributions} is a different and
+generally \textbf{non-convex} problem: the tail scenario set
+$T_\alpha(w)$ itself depends on $w$ (which scenarios fall in the tail
+changes as weights change), so $\text{RC}_i(w)$ is not a smooth,
+well-behaved function of $w$ globally. This is the central
+implementation difficulty that differentiates this project from a
+superficial ``risk parity in Python'' clone, and it is treated
+explicitly rather than glossed over.
+
+\subsection{Solving algorithm: cyclical / iterative update}
+
+Analogous in spirit to the vol-ERC algorithm, but with no guarantee of
+convergence, so convergence is tracked and reported rather than assumed:
+
+\begin{enumerate}
+    \item Start from an initial guess $w^{(0)}$ (e.g.\ equal weight, or
+    the vol-ERC solution).
+    \item At iteration $k$: compute $\text{RC}_i(w^{(k)})$ using the
+    scenario-based estimator above.
+    \item Nudge weights toward equalizing contributions (e.g.\ multiply
+    each $w_i$ by a factor pulling $\text{RC}_i$ toward the target budget
+    $b_i \cdot \CVar_\alpha(w^{(k)})$, then renormalize to sum to 1 and
+    project onto $w \geq 0$).
+    \item Record the dispersion objective
+    $D^{(k)} = \sum_{i,j}(\text{RC}_i(w^{(k)}) - \text{RC}_j(w^{(k)}))^2$.
+    \item Stop when $D^{(k)} < \texttt{tol}$ or after
+    \texttt{max\_iter} iterations (see
+    \texttt{OptimizationParams} in \texttt{riskparity/config.py}).
+\end{enumerate}
+
+\texttt{riskparity/optimization/cvar\_parity.py::solve\_cvar\_parity}
+(not yet implemented) must return \texttt{(weights, convergence\_history)}
+so the sequence $D^{(0)}, D^{(1)}, \dots$ can be inspected and plotted --
+this convergence plot is itself one of the figures in
+\texttt{results/figures/} (Section~\ref{sec:results}), and if convergence
+turns out to be unreliable on this universe, that is a finding to
+document, not a bug to hide.
+
+% ============================================================================
+\section{Backtest Methodology}
+\label{sec:backtest}
+% ============================================================================
+
+\subsection{Rolling, no-look-ahead scheme}
+
+At each rebalance date $t$ (frequency set by
+\texttt{BacktestParams.rebalance\_freq}), each strategy's weights are
+computed using \emph{only} data strictly before $t$ -- the covariance
+estimate or the scenario set passed to a solver must never include
+information from $t$ onward. Weights are then held until the next
+rebalance date, and a transaction cost of
+\texttt{BacktestParams.transaction\_cost\_bps} basis points is applied to
+turnover at each rebalance.
+
+\subsection{Risk-contribution drift}
+
+A risk-parity portfolio is only balanced \emph{at} the rebalance date --
+between rebalances, prices move and weights (hence contributions) drift
+away from the target. Tracking $\%\text{RC}_i$ at $t, t+1, t+2, \dots$
+using the weights fixed at $t$ answers ``does the portfolio stay balanced
+between rebalances,'' which matters in practice and is easy to overlook
+if only the at-rebalance contributions are checked.
+
+\subsection{Stress windows}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Period & Window \\
+\midrule
+GFC 2008 & 2008-09-01 -- 2009-03-31 \\
+Euro crisis 2011 & 2011-07-01 -- 2011-10-31 \\
+Taper tantrum 2013 & 2013-05-01 -- 2013-09-30 \\
+Vol shock 2018 & 2018-10-01 -- 2018-12-31 \\
+COVID crash 2020 & 2020-02-19 -- 2020-03-23 \\
+Rate shock 2022 & 2022-01-01 -- 2022-10-31 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\todo[inline]{Dates are approximate placeholders from
+\texttt{riskparity/backtest/stress\_periods.py}; tighten against the
+actual ETF price history once data is downloaded (see
+\texttt{PROJECT\_BRIEF.md}, ``Open questions'').}
+
+% ============================================================================
+\section{Comparison Metrics}
+\label{sec:metrics}
+% ============================================================================
+
+Planned in \texttt{riskparity/analysis/compare.py}:
+\begin{itemize}
+    \item \textbf{Performance table}: annualized return, annualized
+    volatility, Sharpe ratio, maximum drawdown, Calmar ratio, average
+    turnover -- one row per strategy (Equal-Weight, Min-Variance,
+    Vol-ERC, CVaR-Parity).
+    \item \textbf{Diversification ratio}: weighted average of individual
+    asset volatilities divided by portfolio volatility,
+    $\text{DR}(w) = \dfrac{\sum_i w_i \sigma_i}{\sigma_p(w)} \geq 1$ --
+    the classic risk-parity diversification metric.
+    \item \textbf{Risk-contribution stability}: standard deviation of
+    $\%\text{RC}_i$ across the backtest, per asset, per strategy -- the
+    number that determines whether the CVaR-parity ``stays balanced under
+    stress'' story actually holds up empirically, reported honestly
+    either way.
+\end{itemize}
+
+% ============================================================================
+\section{Implementation Log}
+\label{sec:impl-log}
+% ============================================================================
+
+Running log, one subsection per module, updated in the same change that
+implements it. Order follows the ``Suggested build order'' in
+\texttt{CLAUDE.md}. Each entry should eventually contain: the formula
+actually implemented (if it differs from the plan above, explain why),
+a short annotated code excerpt, and what the corresponding test checks.
+
+\subsection{\texttt{risk/volatility.py} -- sample \& shrunk covariance}
+
+Implemented: \texttt{sample\_covariance}, \texttt{shrunk\_covariance},
+\texttt{portfolio\_volatility}.
+
+\begin{lstlisting}
+TRADING_DAYS_PER_YEAR = 252
+
+def sample_covariance(returns: pd.DataFrame, lookback_days: int) -> pd.DataFrame:
+    window = returns.tail(lookback_days)
+    if len(window) < 2:
+        raise ValueError(f"sample_covariance: need at least 2 observations, got {len(window)}")
+    daily_cov = window.cov()
+    return daily_cov * TRADING_DAYS_PER_YEAR
+
+def shrunk_covariance(returns: pd.DataFrame, lookback_days: int, shrinkage: float) -> pd.DataFrame:
+    if not 0.0 <= shrinkage <= 1.0:
+        raise ValueError(f"shrinkage must be in [0, 1], got {shrinkage}")
+    sample_cov = sample_covariance(returns, lookback_days)
+    target = pd.DataFrame(
+        np.diag(np.diag(sample_cov.values)),
+        index=sample_cov.index, columns=sample_cov.columns,
+    )
+    return (1.0 - shrinkage) * sample_cov + shrinkage * target
+
+def portfolio_volatility(weights: np.ndarray, cov: np.ndarray) -> float:
+    weights = np.asarray(weights, dtype=float)
+    cov = np.asarray(cov, dtype=float)
+    variance = weights @ cov @ weights
+    return float(np.sqrt(max(variance, 0.0)))
+\end{lstlisting}
+
+\paragraph{Annualization.} \texttt{sample\_covariance} takes the trailing
+\texttt{lookback\_days} rows of the daily log-return panel, computes the
+daily sample covariance matrix, and scales it by
+\texttt{TRADING\_DAYS\_PER\_YEAR = 252}. This follows from the
+i.i.d.-return approximation: if daily returns were independent and
+identically distributed, the variance of a $k$-day sum of returns is $k$
+times the daily variance (variances of independent variables add), so a
+daily covariance matrix is scaled by 252 to express the same quantity on
+an annual basis. This is an approximation (returns are not exactly i.i.d.
+in practice -- there is volatility clustering), but it is the standard
+convention and is what makes covariance-derived quantities in this
+project (e.g.\ $\sigma_p(w)$) directly comparable to commonly quoted
+annualized volatility figures.
+
+\paragraph{Shrinkage: fixed intensity toward the diagonal target, not
+\texttt{sklearn}'s automatic \texttt{LedoitWolf}.} The module docstring's
+TODO offered two options: a manually-chosen fixed shrinkage intensity
+using \texttt{RiskParams.covariance\_shrinkage}, or calling
+\texttt{sklearn.covariance.LedoitWolf}, which estimates its own
+data-driven \emph{optimal} shrinkage intensity internally. These two
+options are not composable: if \texttt{LedoitWolf} is used, it ignores
+whatever value is set in \texttt{RiskParams.covariance\_shrinkage} and
+picks its own -- which would make that config field dead, unused
+configuration. Since the explicit design goal of \texttt{config.py}
+(Section~\ref{sec:vol-erc-impl}, and \texttt{PROJECT\_BRIEF.md}) is that
+"what happens if I change the shrinkage intensity?" should be a
+one-line edit, the manual, fixed-intensity version is implemented
+instead:
+\[
+\Sigma_{\text{shrunk}} = (1-\delta)\, \Sigma_{\text{sample}} + \delta\, T,
+\qquad \delta = \texttt{RiskParams.covariance\_shrinkage},
+\]
+where the shrinkage target $T = \mathrm{diag}(\mathrm{diag}(\Sigma_{\text{sample}}))$
+keeps every asset's variance unchanged (the diagonal) and shrinks every
+off-diagonal covariance -- and therefore every implied correlation --
+toward 0. The diagonal target is the specific structured target used
+(rather than, e.g., a constant-correlation target) because variances are
+generally much better estimated from limited history than pairwise
+correlations are, so it is the correlations that benefit most from being
+pulled toward a simpler, lower-variance estimate. At $\delta=0$ this
+reduces exactly to the sample covariance; at $\delta=1$ it is fully
+diagonal (a zero-correlation assumption across all assets).
+
+\paragraph{Honesty about the effect size.} With only 6 assets and a
+252-day (roughly one trading year) lookback window, the sample covariance
+here is already reasonably well-conditioned -- shrinkage's practical
+effect on this project's specific universe is expected to be modest. It
+is implemented anyway because (a) it is the textbook-correct response to
+estimation error that grows as the number of assets approaches the
+number of observations, and demonstrating that awareness is one of the
+project's explicit goals (Section~\ref{sec:qa-log} is not the place for
+this, but \texttt{PROJECT\_BRIEF.md}'s "target audience" section is), and
+(b) it is a one-parameter, cheaply reversible choice
+(\texttt{RiskParams.covariance\_shrinkage = 0.0} disables it entirely)
+that costs nothing to leave in.
+
+\paragraph{Tests (\texttt{tests/test\_volatility.py}).}
+\begin{itemize}
+    \item \texttt{sample\_covariance} matches a manual
+    \texttt{returns.tail(n).cov() * 252} computation, both for the
+    default lookback and for a shorter one -- confirming the window
+    slicing is exact, not off-by-one.
+    \item Fewer than 2 observations in the window raises rather than
+    returning a degenerate (all-\texttt{NaN} or divide-by-zero)
+    covariance matrix.
+    \item $\delta = 0$ recovers the sample covariance exactly;
+    $\delta = 1$ produces an exactly diagonal matrix; at $\delta = 0.5$
+    the diagonal (variances) is untouched while only the off-diagonal
+    entries move -- directly testing the "shrink correlations, not
+    variances" design choice above, not just the formula's algebra.
+    \item An out-of-range shrinkage intensity ($\delta = 1.5$) raises.
+    \item \texttt{portfolio\_volatility} matches
+    $\sqrt{w^\top \Sigma w}$ computed directly, and reduces to a single
+    asset's own volatility for a 100\%-concentrated portfolio -- the same
+    edge case already validated for
+    \texttt{volatility\_risk\_contributions} in
+    \texttt{tests/test\_contributions.py}, giving two independent tests
+    of the same invariant from two different modules.
+\end{itemize}
+
+\subsection{\texttt{optimization/erc.py} -- \texttt{solve\_erc}}
+
+Implemented, via the convex log-barrier reformulation
+(Section~\ref{sec:vol-erc}) solved with \texttt{cvxpy}.
+
+\begin{lstlisting}
+w = cp.Variable(n)
+objective = cp.Minimize(0.5 * cp.quad_form(w, cov) - risk_budgets @ cp.log(w))
+problem = cp.Problem(objective, [w >= 1e-12])
+solver_tol = params.tol * 1e-2
+problem.solve(solver=cp.CLARABEL, tol_gap_abs=solver_tol, tol_gap_rel=solver_tol, tol_feas=solver_tol)
+
+raw_weights = np.asarray(w.value).flatten()
+weights = raw_weights / raw_weights.sum()
+
+achieved = volatility_risk_contributions(weights, cov).pct_contribution
+dispersion = float(np.max(np.abs(achieved - risk_budgets)))
+if dispersion > params.tol:
+    logger.warning("... exceeding OptimizationParams.tol ...")
+\end{lstlisting}
+
+\paragraph{Why \texttt{cvxpy} over SLSQP.} The module docstring's TODO
+offered a choice between SLSQP (\texttt{scipy.optimize.minimize}) on the
+direct dispersion objective, or the convex log-barrier reformulation
+solved with \texttt{cvxpy}. \texttt{cvxpy} was chosen: the reformulation
+is provably convex with a unique minimizer (up to scale) for any strictly
+positive risk-budget vector, so a convex solver either certifies it found
+that global optimum or reports infeasibility -- it cannot silently settle
+for a local optimum the way a general local solver could on a
+hand-rolled, non-convex-looking dispersion objective. The cost is that
+this choice does not reuse machinery for
+\texttt{optimization/cvar\_parity.py}, which has no equivalent convex
+reformulation regardless of what is chosen here (Section~\ref{sec:cvar-parity}).
+
+\paragraph{Unequal risk budgets.} Supported directly and without extra
+solver logic: the reformulation is convex for \emph{any} strictly
+positive budget vector $b$ summing to 1, not only $b_i = 1/n$. Invalid
+budgets (wrong length, non-positive entries, or not summing to 1) raise
+\texttt{ValueError} before the solver is ever invoked.
+
+\paragraph{An environment-specific solver-precision finding.} \texttt{cvxpy}
+picks a default backend solver automatically for a problem needing the
+exponential cone (required by the \texttt{cp.log} term). Left to that
+default, the achieved risk-contribution dispersion after renormalizing
+was only accurate to $\sim 10^{-5}$--$10^{-6}$ -- comfortably converged
+(solver status \texttt{"optimal"}) but not tight enough to satisfy
+\texttt{OptimizationParams.tol}$=10^{-8}$. Rather than loosening
+\texttt{tol} to make the discrepancy disappear, the actual cause was
+identified: explicitly requesting the \texttt{CLARABEL} backend with
+tight tolerances (\texttt{tol\_gap\_abs}, \texttt{tol\_gap\_rel},
+\texttt{tol\_feas}, each set to \texttt{params.tol} $\times 10^{-2}$)
+brings the achieved dispersion down to $\sim 10^{-10}$, safely inside the
+target tolerance. This is the same "measure, don't loosen the test until
+it passes" discipline the testing philosophy calls for
+(Section~\ref{sec:qa-log} has the related war story about
+\texttt{cvxpy} failing to import at all on this development machine
+before that was resolved).
+
+\paragraph{Convergence verification.} After solving, the function
+recomputes \%RC$_i$ at the returned weights via
+\texttt{volatility\_risk\_contributions} (Section~\ref{sec:vol-erc-impl})
+and compares it against the target risk budgets; a deviation larger than
+\texttt{OptimizationParams.tol} is logged as a warning rather than
+raised, since a numerical solver's status of \texttt{"optimal"} is not by
+itself a guarantee of any particular downstream precision -- this makes
+the check an observable diagnostic rather than a silent assumption.
+
+\paragraph{Tests (\texttt{tests/test\_erc.py}).}
+\begin{itemize}
+    \item Weights are long-only and sum to 1.
+    \item Risk contributions are equal at the returned optimum (within
+    \texttt{1e-6}), fed back through
+    \texttt{volatility\_risk\_contributions} rather than trusted from the
+    solver's internal state.
+    \item Matches the closed-form $w_i \propto 1/\sigma_i$ two-asset case
+    (Section~\ref{sec:two-asset}) -- here the solver must \emph{discover}
+    those weights, rather than being handed them as in
+    \texttt{tests/test\_contributions.py}.
+    \item A symmetric case (equal variances, equal pairwise correlation)
+    gives exactly equal weights, as required by symmetry.
+    \item Unequal risk budgets are honored: a 75/25 budget on the
+    two-asset case produces \%RC $\approx$ (0.75, 0.25).
+    \item An invalid risk-budget vector (does not sum to 1) raises
+    before the solver runs.
+\end{itemize}
+
+\subsection{\texttt{risk/tail\_risk.py} -- historical \& Cornish-Fisher CVaR}
+\todo[inline]{Not implemented yet.}
+
+\subsection{\texttt{risk/contributions.py} -- \texttt{cvar\_risk\_contributions}}
+\todo[inline]{Not implemented yet. Will report the measured residual of
+$\sum_i \text{RC}_i$ vs.\ $\CVar_\alpha(w)$ and the chosen tolerance.}
+
+\subsection{\texttt{optimization/cvar\_parity.py} -- \texttt{solve\_cvar\_parity}}
+\todo[inline]{Not implemented yet. Will report the convergence plot and
+the skewed-universe divergence test result (the central empirical claim
+of the project).}
+
+\subsection{\texttt{data/download.py} -- \texttt{download\_prices}}
+
+Implemented. This is the only module in the codebase allowed to call
+\texttt{yfinance} -- every other module downstream only ever sees a plain
+\texttt{pandas.DataFrame} of prices, so the data source could later be
+swapped (e.g.\ for a paid vendor) without touching any risk or
+optimization code.
+
+\begin{lstlisting}
+def download_prices(universe: Universe, cache_path: str | None = "data/raw/prices_raw.parquet") -> pd.DataFrame:
+    cache_file = Path(cache_path) if cache_path is not None else None
+    if cache_file is not None and cache_file.exists():
+        return pd.read_parquet(cache_file)
+
+    raw = yf.download(
+        list(universe.tickers),
+        start=universe.start_date,
+        end=universe.end_date,
+        auto_adjust=True,
+        progress=False,
+    )
+    if raw.empty:
+        raise RuntimeError(f"yfinance returned no data for tickers {universe.tickers}")
+
+    prices = raw["Close"]
+    if isinstance(prices, pd.Series):
+        prices = prices.to_frame(name=universe.tickers[0])
+    prices = prices.reindex(columns=list(universe.tickers))
+
+    dropped = [t for t in universe.tickers if prices[t].isna().all()]
+    if dropped:
+        logger.warning("Tickers with no data returned, dropped: %s", dropped)
+        prices = prices.drop(columns=dropped)
+
+    inception = prices.apply(lambda col: col.first_valid_index())
+    late_starters = inception[inception > prices.index.min()]
+    if not late_starters.empty:
+        logger.info("Tickers with later inception dates than the universe start: %s", late_starters.to_dict())
+
+    if cache_file is not None:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        prices.to_parquet(cache_file)
+
+    return prices
+\end{lstlisting}
+
+Step by step, what this function actually does:
+
+\begin{enumerate}
+    \item \textbf{Cache short-circuit.} If \texttt{cache\_path} is given
+    and the parquet file already exists at that path, it is loaded and
+    returned immediately -- \texttt{yfinance} is never called. This is
+    what makes repeated runs of \texttt{scripts/run\_pipeline.py} fast
+    and usable offline, and is why \texttt{data/raw/} is gitignored
+    (Section~\ref{sec:vol-erc-impl} and \texttt{.gitignore}): the cache
+    is a regenerable artifact, not something to commit.
+
+    \item \textbf{Download.} \texttt{yfinance.download} is called once
+    for the full list of tickers with \texttt{auto\_adjust=True}, which
+    means the returned \texttt{"Close"} column is already a
+    \emph{total-return-adjusted} close (splits and dividends folded in)
+    rather than the raw exchange close -- this is the series that should
+    be used for return computation, since a stock split or dividend
+    payment is not a real economic loss/gain and must not appear as one
+    in \texttt{compute\_log\_returns} later. \texttt{progress=False}
+    silences \texttt{yfinance}'s console progress bar, which is noise in
+    a script/pipeline context. If the whole call returns an empty
+    result (e.g.\ no network, or every ticker invalid), that is treated
+    as fatal (\texttt{RuntimeError}) rather than silently propagating an
+    empty DataFrame downstream.
+
+    \item \textbf{Column extraction.} For multiple tickers,
+    \texttt{yfinance.download} returns columns as a
+    \texttt{(field, ticker)} \texttt{MultiIndex} (e.g.\
+    \texttt{("Close", "SPY")}); indexing \texttt{raw["Close"]} collapses
+    this to a plain DataFrame with one column per ticker. For the
+    degenerate single-ticker case \texttt{yfinance} instead returns a
+    flat frame whose \texttt{"Close"} selection is a bare
+    \texttt{pd.Series} with no column name -- the
+    \texttt{isinstance(prices, pd.Series)} branch re-wraps that case into
+    a one-column DataFrame named after the ticker, so the function's
+    return type is uniform regardless of universe size. Columns are then
+    reindexed to \texttt{universe.tickers}' declared order, since
+    \texttt{yfinance} does not guarantee it echoes back the input order.
+
+    \item \textbf{Fully-missing tickers are dropped, not silently kept.}
+    A ticker whose entire column is \texttt{NaN} (typo, delisted, or not
+    covered by Yahoo Finance) would otherwise poison every downstream
+    covariance/CVaR computation that touches it. It is detected
+    (\texttt{prices[t].isna().all()}), dropped, and logged as a warning
+    -- an explicit, auditable decision rather than an all-\texttt{NaN}
+    column quietly surviving into \texttt{clean\_prices}.
+
+    \item \textbf{Late-starting tickers are reported, not corrected
+    here.} A ticker whose price history begins after
+    \texttt{universe.start\_date} (e.g.\ a commodities or REIT ETF that
+    launched later than the long-treasury ETF) is detected via
+    \texttt{first\_valid\_index()} and logged at \texttt{info} level.
+    Deliberately, \emph{nothing is done about it in this function} --
+    deciding how to handle a partial history (drop the ticker, truncate
+    the whole universe to the common start date, or something else) is a
+    judgment call about the analysis, not about data acquisition, so
+    it is left to \texttt{clean\_prices} (Section below). This keeps the
+    module boundary from the design intent honest: \texttt{download.py}
+    reports what the raw data looks like; it does not decide how to use
+    it.
+
+    \item \textbf{Cache write.} If a cache path was given (and it wasn't
+    already used to short-circuit in step 1), the resulting DataFrame is
+    written to parquet, creating \texttt{data/raw/} if it does not exist
+    yet.
+
+    \item \textbf{Return value.} A DataFrame indexed by trading date,
+    one column per surviving ticker, values = adjusted close price --
+    exactly the contract documented in the function's docstring, and the
+    input type every downstream module (\texttt{clean\_prices},
+    eventually \texttt{risk/volatility.py}, etc.) is written against.
+\end{enumerate}
+
+\subsection{\texttt{data/clean.py} -- \texttt{clean\_prices}, \texttt{compute\_log\_returns}}
+
+Implemented. This module is where the late-starting/missing-data
+situations that \texttt{download\_prices} only \emph{reports}
+(Section above) actually get resolved into a single, fully-populated
+price panel.
+
+\begin{lstlisting}
+MAX_FFILL_DAYS = 5
+
+def clean_prices(raw_prices: pd.DataFrame) -> pd.DataFrame:
+    prices = raw_prices.sort_index().ffill(limit=MAX_FFILL_DAYS)
+
+    before = len(prices)
+    prices = prices.dropna(how="any")
+    after = len(prices)
+    if after < before:
+        logger.info(
+            "clean_prices: dropped %d/%d rows still containing NaNs after "
+            "forward-fill (limit=%d days) -- likely pre-inception rows for "
+            "a late-starting ticker",
+            before - after, before, MAX_FFILL_DAYS,
+        )
+    if prices.empty:
+        raise ValueError("clean_prices: no rows remain after alignment/cleaning")
+
+    return prices
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    return np.log(prices).diff().dropna(how="all")
+\end{lstlisting}
+
+\paragraph{Two-tier gap policy.} The function distinguishes two kinds of
+missing data with two different fixes, rather than treating every
+\texttt{NaN} the same way:
+\begin{itemize}
+    \item \textbf{Short gaps ($\leq$ \texttt{MAX\_FFILL\_DAYS} = 5
+    trading days)} -- e.g.\ a one-off data-vendor hiccup, or a listing
+    trading on a slightly different holiday calendar than the rest of
+    the universe -- are \textbf{forward-filled}: the last known price is
+    carried forward. This is a reasonable approximation for a short gap
+    because the true (unobserved) price is very likely close to the last
+    traded one.
+    \item \textbf{Long gaps} -- in practice, almost always a ticker that
+    simply had not started trading yet at the start of the requested
+    window (e.g.\ \texttt{DBC} or \texttt{VNQ} launching after
+    \texttt{Universe.start\_date = "2007-01-01"}) -- are \textbf{not}
+    forward-filled indefinitely. \texttt{ffill(limit=5)} only fills up to
+    5 consecutive days, so a pre-inception run of missing values longer
+    than that still contains \texttt{NaN}s after the fill step. Those
+    rows are then dropped by \texttt{dropna(how="any")}. The net effect
+    is an \textbf{inner join on dates}: the cleaned panel starts on the
+    date every surviving ticker has real data, not on
+    \texttt{Universe.start\_date} -- fabricating five years of a
+    constant "first price" for a late-starting ETF would silently
+    understate its true volatility and bias every risk measure computed
+    on it, which is worse than simply shortening the usable history.
+    This is logged at \texttt{info} level so the size of the truncation
+    is visible, not hidden inside a silently shorter DataFrame.
+    \item If cleaning leaves \emph{no} rows at all (e.g.\ two tickers
+    with non-overlapping histories), that is treated as a fatal
+    \texttt{ValueError} rather than returning an empty, technically
+    valid but useless DataFrame to the rest of the pipeline.
+\end{itemize}
+
+\paragraph{Log returns.} $r_t = \ln(P_t / P_{t-1})$ is used everywhere in
+this project instead of simple returns
+$\tilde r_t = P_t/P_{t-1} - 1$, for two reasons relevant to the risk
+engines built on top of it:
+\begin{itemize}
+    \item \textbf{Time-additivity.} The $k$-day log return is simply the
+    sum of the daily log returns,
+    $\ln(P_t/P_{t-k}) = \sum_{j=0}^{k-1} r_{t-j}$, which is what makes
+    rolling-window aggregation (covariance over a lookback window, CVaR
+    over a scenario window) straightforward. Simple returns do not add
+    this way across time.
+    \item \textbf{Symmetry.} Log returns treat a doubling and a halving
+    of price symmetrically ($\ln 2 = -\ln(0.5)$), which is a better
+    behaved input to variance/tail estimation than simple returns, whose
+    distribution is skewed purely as an artifact of the compounding
+    definition even if the underlying price process were symmetric.
+\end{itemize}
+\texttt{compute\_log\_returns} takes $\ln$ of the whole price panel
+(vectorized, one call for every ticker) and then \texttt{diff()}s along
+the date axis; the resulting first row is always \texttt{NaN} (there is
+no previous price to compare the first observation to) and is dropped
+with \texttt{dropna(how="all")}.
+
+\paragraph{Tests (\texttt{tests/test\_data\_clean.py}).}
+\begin{itemize}
+    \item A single-day \texttt{NaN} is forward-filled and the row
+    survives.
+    \item A 7-day leading \texttt{NaN} run (longer than
+    \texttt{MAX\_FFILL\_DAYS}) is \emph{not} filled -- those rows are
+    dropped and the cleaned panel starts on the first date where every
+    ticker has real data.
+    \item An all-\texttt{NaN} ticker causes \texttt{clean\_prices} to
+    raise, rather than silently returning an empty frame.
+    \item \texttt{compute\_log\_returns} matches a direct
+    \texttt{np.log(prices).diff()} computation, and is exactly zero every
+    day for a constant (no-movement) price series -- a trivial but
+    useful sanity check that the sign and scale of the transform are
+    right.
+\end{itemize}
+
+\subsection{\texttt{backtest/engine.py}}
+\todo[inline]{Not implemented yet.}
+
+\subsection{\texttt{analysis/compare.py}, \texttt{analysis/plots.py}}
+\todo[inline]{Not implemented yet.}
+
+% ============================================================================
+\section{Empirical Results}
+\label{sec:results}
+% ============================================================================
+
+\todo[inline]{Populate once \texttt{scripts/run\_pipeline.py} produces
+output in \texttt{results/}. Figures below are wired to appear
+automatically (via \texttt{IfFileExists}) once the corresponding file is
+generated -- no need to edit the includegraphics calls later, just run
+the pipeline and recompile.}
+
+\paragraph{Risk contributions, single date (Vol-ERC vs.\ CVaR-Parity).}
+\IfFileExists{../results/figures/risk_contributions.png}{
+    \begin{center}\includegraphics[width=0.8\textwidth]{../results/figures/risk_contributions.png}\end{center}
+}{\todo[inline]{Figure not yet generated: \texttt{results/figures/risk\_contributions.png}}}
+
+\paragraph{Cumulative returns, all strategies.}
+\IfFileExists{../results/figures/cumulative_returns.png}{
+    \begin{center}\includegraphics[width=0.8\textwidth]{../results/figures/cumulative_returns.png}\end{center}
+}{\todo[inline]{Figure not yet generated: \texttt{results/figures/cumulative\_returns.png}}}
+
+\paragraph{Rolling risk-contribution stability.}
+\IfFileExists{../results/figures/contribution_stability.png}{
+    \begin{center}\includegraphics[width=0.8\textwidth]{../results/figures/contribution_stability.png}\end{center}
+}{\todo[inline]{Figure not yet generated: \texttt{results/figures/contribution\_stability.png}}}
+
+\paragraph{CVaR-parity convergence diagnostic.}
+\IfFileExists{../results/figures/cvar_parity_convergence.png}{
+    \begin{center}\includegraphics[width=0.8\textwidth]{../results/figures/cvar_parity_convergence.png}\end{center}
+}{\todo[inline]{Figure not yet generated: \texttt{results/figures/cvar\_parity\_convergence.png}}}
+
+\paragraph{Performance table.}
+\todo[inline]{Insert \texttt{results/tables/performance\_table} once
+\texttt{analysis/compare.py::performance\_table} is implemented.}
+
+% ============================================================================
+\section{Session Q\&A Log}
+\label{sec:qa-log}
+% ============================================================================
+
+An append-only log of questions asked during work sessions on this
+project, with the answers given, kept for the same reason the rest of
+this notebook exists: so reasoning and context survive past the chat
+window they happened in. Entries are added chronologically, translated
+to English if asked in another language, and are not removed or
+rewritten once logged (a later entry may supersede an earlier one, but
+the earlier one stays as a record of how understanding evolved).
+
+\begin{description}[style=nextline,leftmargin=0pt]
+
+\item[Q: Does Claude Code retain memory of previous conversations on this project?]
+No. Each session starts without memory of prior chat sessions; nothing
+persists automatically. The only things that carry over between sessions
+are whatever gets written to durable files in the repository -- which is
+exactly why \texttt{CLAUDE.md}, \texttt{PROJECT\_BRIEF.md}, and this
+notebook exist: they are the persistence layer for context that would
+otherwise be lost.
+
+\item[Q: What is the purpose of a \texttt{CLAUDE.md} file?]
+It is a project-level context file that Claude Code reads automatically
+at the start of a session in a repository. It holds repo-specific
+working instructions -- common commands (build/lint/test), architecture,
+conventions, and known pitfalls -- so they do not need to be repeated in
+every conversation. It can live at the repo root (shared with a team via
+git) and/or globally in the user's home directory for personal
+cross-project preferences.
+
+\item[Q: What is the difference between \texttt{PROJECT\_BRIEF.md} and \texttt{CLAUDE.md}?]
+They serve different audiences and purposes rather than duplicating one
+another. \texttt{PROJECT\_BRIEF.md} is a design log written for a human
+(the project owner, later, or a recruiter/interviewer): it records
+\emph{why} the project is scoped and structured the way it is, and which
+alternatives were considered and rejected. \texttt{CLAUDE.md} is
+operational guidance written for the AI assistant: \emph{how} to work in
+the repository -- commands to run, the architecture map, invariants not
+to break. This notebook, \texttt{docs/notes.tex}, complements both as the
+place where the actual finance/math/code \emph{content} lives, updated as
+the project advances.
+
+\item[Q: Can we already test whether \texttt{python scripts/run\_pipeline.py} runs end to end?]
+At the time of asking: no. Nearly every function in \texttt{riskparity/}
+was still a stub (\texttt{raise NotImplementedError}); only
+\texttt{volatility\_risk\_contributions} was implemented. Running the
+pipeline first failed on a packaging problem --
+\texttt{ModuleNotFoundError: No module named 'riskparity'} -- because the
+package had no \texttt{pyproject.toml} and was never installed into the
+project's \texttt{.venv}. Adding a minimal \texttt{pyproject.toml} and
+running \texttt{pip install -r requirements.txt -e .} fixed that; after
+the fix, the pipeline correctly progressed to and failed at the first
+real stub, \texttt{download\_prices}, which is the expected state of an
+unfinished implementation, not a plumbing bug.
+
+\item[Q: Where do I add Python libraries, and how?]
+In \texttt{requirements.txt} at the repository root -- that is the single
+place dependencies are declared. To install what is already listed:
+\texttt{pip install -r requirements.txt} inside the project's
+\texttt{.venv}. To add a new dependency: append a line to
+\texttt{requirements.txt} (ideally with a minimum version constraint,
+matching the style of the existing entries) and re-run the same install
+command; pip only needs to install the new line since the rest are
+already satisfied.
+
+\item[Q: I don't see the result of the assertions in your tests -- how do I know what the code actually produced?]
+This is expected \texttt{pytest} behavior, not a gap in the tests:
+\texttt{pytest} only reports PASSED/FAILED by design and does not print
+intermediate values for a passing assertion -- values are only shown
+automatically when an assertion \emph{fails}, via \texttt{pytest}'s
+assertion-rewriting diff. To see the actual computed values on a passing
+run, either add explicit \texttt{print()} calls and run with
+\texttt{pytest -s}, or run a short standalone script that calls the
+function directly and prints its output (done for
+\texttt{clean\_prices}/\texttt{compute\_log\_returns} to confirm the
+forward-fill and truncation behavior visually, e.g.\ the 7-day
+pre-inception gap for a late-starting ticker being dropped rather than
+filled).
+
+\item[Q: \texttt{cvxpy} fails to import with a DLL load error blocked by "a stratégie de contrôle d'application" (an application control policy) -- what is going on, and how was it resolved?]
+The failure was traced to a native compiled dependency of \texttt{cvxpy}
+(\texttt{qdldl}, imported eagerly by \texttt{cvxpy}'s own
+\texttt{\_\_init\_\_} regardless of which solver backend is actually
+used) being blocked by \textbf{Windows Smart App Control}, a system-wide
+policy on this development machine that only allows binaries with a
+recognized reputation/signature to load
+(\texttt{VerifiedAndReputablePolicyState = 1} in the registry). Unlike an
+ordinary "downloaded file" block, this is not fixed by
+\texttt{Unblock-File} (which only clears the NTFS zone-identifier
+stream, not an application-control decision) -- Microsoft's own
+documentation states Smart App Control normally cannot be turned off
+once enabled without reinstalling Windows. In this case the user
+disabled it directly; after that, \texttt{import cvxpy} succeeded and
+\texttt{solve\_erc}'s existing \texttt{cvxpy}-based implementation
+(Section~\ref{sec:impl-log}) worked without needing to be rewritten
+around a different solver library.
+
+\item[Q: Explain in detail the risk-contribution dispersion check at the end of \texttt{solve\_erc} (\texttt{riskparity/optimization/erc.py}, the block recomputing \texttt{achieved} and comparing it to \texttt{risk\_budgets}).]
+This block is a post-hoc numerical verification, not a step needed to
+produce the answer. After the convex solve, \texttt{weights} are
+renormalized (line~92); the block then recomputes the actually-achieved
+percentage risk contributions by calling
+\texttt{volatility\_risk\_contributions(weights, cov).pct\_contribution}
+-- the same reference function documented in
+Section~\ref{sec:vol-erc-impl} -- rather than trusting the solver's
+internal state. \texttt{dispersion} is the largest absolute deviation
+(infinity norm) between the achieved contributions and the target
+\texttt{risk\_budgets}. If it exceeds \texttt{OptimizationParams.tol}, a
+\texttt{logger.warning} records the magnitude of the deviation, the
+tolerance it exceeded, and the solver's own status string
+(\texttt{"optimal"} vs.\ \texttt{"optimal\_inaccurate"}) for diagnosis.
+It is a warning, not a raised exception, deliberately: the convex
+reformulation's optimum is exact in theory, but a numerical solver only
+reaches it to floating-point/solver tolerance, so treating a small
+overshoot as fatal would break the pipeline for cases that are still
+perfectly usable -- consistent with this project's rule (\texttt{CLAUDE.md})
+of reporting numerical imprecision honestly via logs rather than hiding
+it \emph{or} treating it as an unconditional failure.
+
+\item[Q: Why does \texttt{solve\_erc} accept solver status \texttt{"optimal\_inaccurate"} as valid, alongside \texttt{"optimal"} (line~88)?]
+\texttt{"optimal\_inaccurate"} is a legitimate CLARABEL/\texttt{cvxpy}
+convergence outcome, not a failure: it means the solver reached a point
+consistent with the optimum but did not fully satisfy the requested
+convergence tolerances (\texttt{tol\_gap\_abs}, \texttt{tol\_gap\_rel},
+\texttt{tol\_feas}, set on line~86 to
+\texttt{params.tol}$\times 10^{-2}$ -- deliberately tighter than the
+tolerance ultimately required). Genuine failures
+(\texttt{"infeasible"}, \texttt{"unbounded"}, etc.) are distinct
+statuses and are excluded by the same check. Accepting
+\texttt{"optimal\_inaccurate"} here does not mean precision is
+unchecked: the dispersion block described in the previous entry
+recomputes the actual achieved contributions regardless of which of
+the two accepted statuses was returned, so the solver's status string
+is only used to reject hard failures, while the real precision
+judgment is made numerically on the recomputed result, not trusted
+from the label alone.
+
+\item[Q: Explain \texttt{riskparity/risk/contributions.py} in detail.]
+Covered in full in Section~\ref{sec:vol-erc-impl} (the
+\texttt{RiskContributions} dataclass and the implemented
+\texttt{volatility\_risk\_contributions}) and
+Section~\ref{sec:cvar-parity} (the stubbed
+\texttt{cvar\_risk\_contributions}, not yet implemented). Separately, a
+stray file \texttt{riskparity/risk/contrib.py} was found alongside it
+during this session -- not referenced anywhere in \texttt{CLAUDE.md} or
+imported by any other module, and containing broken code: a
+non-existent type (\texttt{np.darray}, a typo for \texttt{np.ndarray})
+and a function (\texttt{volatility\_risk\_contrib}) defined nested
+inside the \texttt{RiskContrib} dataclass body without \texttt{self} or
+a \texttt{@staticmethod} decorator, which would not work if called. It
+appears to be an abandoned duplicate draft of this module, similar in
+kind to a stray \texttt{ercc.py} found next to
+\texttt{optimization/erc.py} earlier in the session -- flagged to the
+project owner rather than deleted unilaterally.
+
+\item[Q: What is \texttt{@dataclass}, and is it needed for \texttt{RiskContributions}?]
+\texttt{@dataclass} (from the standard-library \texttt{dataclasses}
+module) generates \texttt{\_\_init\_\_}, \texttt{\_\_repr\_\_}, and
+\texttt{\_\_eq\_\_} automatically from a class's type-annotated fields,
+instead of those being written by hand. It is a good fit for
+\texttt{RiskContributions} (Section~\ref{sec:vol-erc-impl}) because
+that class is a pure result container -- four arrays/scalars that
+always travel together with no behavior of their own -- which is
+exactly the use case the decorator targets; it is what allows the
+keyword-argument construction
+(\texttt{RiskContributions(total\_risk=..., marginal=..., ...)}) used
+in \texttt{contributions.py}. The stray \texttt{contrib.py} file
+(previous entry) shows the decorator's actual limit: it only
+auto-generates behavior for declared fields, so a method carelessly
+nested inside the dataclass body without \texttt{self} or
+\texttt{@staticmethod} is still broken -- \texttt{@dataclass} does not
+protect against that kind of structural mistake.
+
+\end{description}
+
+% ============================================================================
+\section{Glossary of Finance Concepts}
+\label{sec:glossary}
+% ============================================================================
+
+\begin{description}[leftmargin=3.5cm, style=nextline]
+    \item[Risk parity / ERC] Portfolio construction approach that
+    allocates so that each asset contributes equally to total portfolio
+    risk, rather than allocating equal capital (equal-weight) or
+    minimizing total risk regardless of concentration (min-variance).
+    \item[Diversification ratio] Ratio of the weighted average of
+    individual asset volatilities to portfolio volatility; equals~1 for a
+    single asset and increases with genuine diversification benefit.
+    \item[Value at Risk (VaR)] The loss level not expected to be exceeded
+    with probability $\alpha$ over a given horizon; a quantile of the
+    loss distribution.
+    \item[Conditional VaR (CVaR) / Expected Shortfall] The expected loss
+    \emph{given} that the loss exceeds VaR; averages the tail beyond the
+    VaR quantile rather than reporting a single cutoff, and is a coherent
+    (subadditive) risk measure, unlike VaR.
+    \item[Tail risk] Risk of extreme, low-probability losses that are
+    underestimated by measures (like volatility) that only use the first
+    two moments of the return distribution.
+    \item[Covariance shrinkage] Regularizing a sample covariance matrix
+    estimate toward a structured target (e.g.\ constant correlation) to
+    reduce estimation error, especially important when the number of
+    assets is not small relative to the number of observations.
+    \item[Turnover] Fraction of portfolio value traded at a rebalance;
+    drives transaction costs.
+    \item[Drawdown] Peak-to-trough decline in cumulative portfolio value;
+    \emph{maximum drawdown} is the worst such decline over the backtest.
+    \item[Sharpe ratio] Annualized excess return divided by annualized
+    volatility; a risk-adjusted return measure that does \emph{not}
+    distinguish upside from downside volatility (unlike CVaR-based
+    measures).
+    \item[Calmar ratio] Annualized return divided by maximum drawdown; a
+    tail-oriented alternative to the Sharpe ratio.
+\end{description}
+
+% ============================================================================
+\begin{thebibliography}{9}
+
+\bibitem{maillard2010}
+Maillard, S., Roncalli, T., \& Teïletche, J. (2010).
+\emph{The Properties of Equally Weighted Risk Contribution Portfolios.}
+Journal of Portfolio Management.
+
+\bibitem{boudt2013}
+Boudt, K., Peterson, B., \& Carl, P. (2013).
+\emph{Component VaR and CVaR.}
+
+\bibitem{rockafellar2000}
+Rockafellar, R.~T., \& Uryasev, S. (2000).
+\emph{Optimization of Conditional Value-at-Risk.}
+Journal of Risk.
+
+\bibitem{roncalli2013}
+Roncalli, T. (2013).
+\emph{Introduction to Risk Parity and Budgeting.}
+Chapman \& Hall/CRC.
+
+\end{thebibliography}
+
+\end{document}
