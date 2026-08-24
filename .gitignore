@@ -7,6 +7,11 @@ venv/
 .pytest_cache/
 *.egg-info/
 
+# Internal working notes -- not meant for the public-facing repo.
+# README.md is the only Markdown file that should be visible on GitHub.
+*.md
+!README.md
+
 # Raw/processed data caches -- regenerable via scripts/run_pipeline.py,
 # no reason to bloat the repo or commit stale market data.
 data/raw/*
