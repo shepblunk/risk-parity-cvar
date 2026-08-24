@@ -53,11 +53,16 @@ class OptimizationParams:
     max_iter: int = 500
     tol: float = 1e-8
     weight_bounds: tuple = (0.0, 1.0)  # long-only by default
+    # Step size for solve_cvar_parity's cyclical weight update (the vol-ERC
+    # solver has no equivalent -- it is solved directly via cvxpy). Kept
+    # here rather than hard-coded so it can be tuned without touching
+    # optimization/cvar_parity.py.
+    cvar_parity_learning_rate: float = 0.05
 
 
 @dataclass(frozen=True)
 class BacktestParams:
-    rebalance_freq: str = "M"  # pandas offset alias: "M", "Q", ...
+    rebalance_freq: str = "ME"  # pandas offset alias: "M", "Q", ...
     transaction_cost_bps: float = 5.0
 
 

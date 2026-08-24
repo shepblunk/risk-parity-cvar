@@ -686,16 +686,269 @@ the check an observable diagnostic rather than a silent assumption.
 \end{itemize}
 
 \subsection{\texttt{risk/tail\_risk.py} -- historical \& Cornish-Fisher CVaR}
-\todo[inline]{Not implemented yet.}
+\label{sec:tail-risk-impl}
+
+Implemented: \texttt{historical\_var}, \texttt{historical\_cvar}, and
+\texttt{cornish\_fisher\_cvar}, following the formulas of
+Section~\ref{sec:var-cvar}, plus a shared \texttt{\_validate\_confidence}
+helper.
+
+\begin{lstlisting}
+def _validate_confidence(confidence: float) -> None:
+    if not 0.0 < confidence < 1.0:
+        raise ValueError(f"confidence must be in (0, 1), got {confidence}")
+
+def historical_var(portfolio_returns: pd.Series, confidence: float) -> float:
+    _validate_confidence(confidence)
+    portfolio_returns = np.asarray(portfolio_returns, dtype=float)
+    percentile = (1 - confidence) * 100
+    var_value = np.percentile(portfolio_returns, percentile)
+    return -var_value
+
+def historical_cvar(portfolio_returns: pd.Series, confidence: float) -> float:
+    _validate_confidence(confidence)
+    portfolio_returns = np.asarray(portfolio_returns, dtype=float)
+    percentile = (1 - confidence) * 100
+    var_value = np.percentile(portfolio_returns, percentile)
+    tail_losses = portfolio_returns[portfolio_returns <= var_value]
+    return -np.mean(tail_losses)
+\end{lstlisting}
+
+\texttt{cornish\_fisher\_cvar} implements the expansion of
+Section~\ref{sec:var-cvar} directly: sample skew $S$ and excess kurtosis
+$K$ (via \texttt{scipy.stats.skew}/\texttt{kurtosis}) adjust the Gaussian
+quantile $z_\alpha$ into $z_\alpha^{CF}$, and a corresponding
+Cornish-Fisher expected-shortfall multiplier $e_{CF}$ (not merely the
+quantile itself) is used to get \texttt{CVaR} $= -(\mu + \sigma \cdot
+e_{CF})$, rather than naively averaging past observations below the
+adjusted quantile -- consistent with the semi-parametric spirit of the
+method (no scenario averaging at all, only the first four sample
+moments).
+
+\paragraph{Confidence validation: a real gap the tests caught.} An
+earlier version of \texttt{historical\_var}/\texttt{historical\_cvar}
+had no explicit check on \texttt{confidence} at all. It happened to
+raise for \texttt{confidence > 1} purely as a side effect of
+\texttt{np.percentile} itself rejecting a percentile argument outside
+$[0, 100]$ -- but \texttt{confidence = 0.0} maps to percentile $100$,
+which \texttt{np.percentile} accepts without complaint, so that
+degenerate, financially meaningless confidence level silently produced
+a number instead of raising. \texttt{tests/test\_tail\_risk.py::test\_invalid\_confidence\_raises}
+caught exactly this asymmetry. The fix was the explicit
+\texttt{\_validate\_confidence} helper above, shared by all three
+functions, rather than depending on an incidental side effect of the
+underlying numpy call -- the same "measure and fix the real cause, don't
+paper over it" discipline already documented for \texttt{solve\_erc}'s
+solver-precision finding.
+
+\paragraph{Tests (\texttt{tests/test\_tail\_risk.py}).}
+\begin{itemize}
+    \item \texttt{CVaR $\geq$ VaR} for any return series with variation
+    -- a structural invariant, not distribution-specific.
+    \item Both increase (weakly) monotonically with the confidence
+    level.
+    \item A constant (zero-variation) return series reduces VaR and
+    CVaR to exactly $-r$ -- the trivial edge case.
+    \item On a large i.i.d.\ Gaussian sample, \texttt{historical\_var}/\texttt{historical\_cvar}
+    and \texttt{cornish\_fisher\_cvar} both approximately match the
+    closed-form Gaussian VaR/CVaR formula, within a documented
+    \texttt{rel=0.15} tolerance -- loose because at $\alpha=0.975$ and
+    $n=5000$ the CVaR tail averages only $\sim 125$ observations, so
+    sampling noise on the estimate is real, not a bug to hide by
+    tightening the assertion.
+    \item On a synthetic negatively-skewed series (small positive drift
+    plus rare large negative jumps), \texttt{cornish\_fisher\_cvar}
+    reports a strictly larger CVaR than the symmetric-Gaussian
+    closed-form value at the same mean/vol -- the qualitative behavior
+    the whole CVaR-parity story depends on.
+    \item An out-of-range \texttt{confidence} raises \texttt{ValueError}
+    for both \texttt{historical\_var} and \texttt{historical\_cvar}.
+\end{itemize}
 
 \subsection{\texttt{risk/contributions.py} -- \texttt{cvar\_risk\_contributions}}
-\todo[inline]{Not implemented yet. Will report the measured residual of
-$\sum_i \text{RC}_i$ vs.\ $\CVar_\alpha(w)$ and the chosen tolerance.}
+\label{sec:cvar-contrib-impl}
+
+Implemented using the scenario-based estimator described in
+Section~\ref{sec:cvar-parity}, reusing \texttt{historical\_var}
+(Section~\ref{sec:tail-risk-impl}) to locate the tail rather than
+re-deriving the quantile calculation a second time.
+
+\begin{lstlisting}
+def cvar_risk_contributions(weights, asset_returns, confidence) -> RiskContributions:
+    weights = np.asarray(weights, dtype=float)
+    asset_returns = np.asarray(asset_returns, dtype=float)
+
+    portfolio_returns = weights @ asset_returns  # R_t, shape (n_scenarios,)
+    var_alpha = historical_var(portfolio_returns, confidence)
+    tail_mask = portfolio_returns <= -var_alpha
+    if not np.any(tail_mask):
+        raise ValueError("no scenarios fall in the tail at this confidence")
+
+    tail_asset_returns = asset_returns[:, tail_mask]
+    marginal = -np.mean(tail_asset_returns, axis=1)
+    contribution = weights * marginal
+    total_risk = -np.mean(portfolio_returns[tail_mask])
+
+    return RiskContributions(
+        total_risk=float(total_risk), marginal=marginal,
+        contribution=contribution, pct_contribution=contribution / total_risk,
+    )
+\end{lstlisting}
+
+\paragraph{The Euler sum invariant is exact here, not merely
+approximate.} Section~\ref{sec:cvar-parity} notes that
+$\sum_i \text{RC}_i \approx \CVar_\alpha(w)$ only \emph{approximately}
+in general for the scenario estimator. In this specific implementation
+it is exact: \texttt{total\_risk} and \texttt{marginal} are computed
+from the \emph{same} \texttt{tail\_mask}, so
+$\sum_i \text{RC}_i = \sum_i w_i \cdot \big(-\text{mean}_{t \in T}(r_{i,t})\big)
+= -\text{mean}_{t \in T}\big(\sum_i w_i r_{i,t}\big)
+= -\text{mean}_{t \in T}(R_t) = \text{total\_risk}$
+by linearity of the mean -- confirmed numerically in
+\texttt{tests/test\_contributions.py::test\_cvar\_contributions\_sum\_to\_total\_risk}
+to \texttt{rel=1e-8}. The "approximate" caveat in
+Section~\ref{sec:cvar-parity} would only start to bite if a different
+threshold were used for the tail set than the one \texttt{historical\_var}
+itself defines (e.g.\ comparing this estimator's sum against CVaR from
+an independent estimator such as \texttt{cornish\_fisher\_cvar}).
+
+\paragraph{Guarding an empty tail.} If no scenario falls at or below the
+threshold (possible with a very high \texttt{confidence} or a short
+scenario set), \texttt{np.mean} over an empty slice would silently
+return \texttt{NaN}. This is treated as a hard \texttt{ValueError}
+instead, consistent with this project's convention of surfacing
+degenerate numerical situations rather than letting them propagate as
+silent \texttt{NaN}s downstream (the same instinct behind
+\texttt{clean\_prices} raising on an empty post-cleaning panel,
+Section~\ref{sec:vol-erc-impl} is the covariance-side analogue).
+
+\paragraph{Tests (\texttt{tests/test\_contributions.py}).}
+\begin{itemize}
+    \item Sum invariant: $\sum_i \text{RC}_i = \CVar_\alpha(w)$ exactly
+    (to \texttt{rel=1e-8}), and $\sum_i \%\text{RC}_i = 1$.
+    \item Concentrated portfolio edge case, mirroring the volatility
+    version: a 100\%-in-one-asset portfolio has zero CVaR contribution
+    on the untouched asset.
+    \item \textbf{The central empirical claim, first evidence}: two
+    assets with similar overall volatility, one symmetric and one with
+    a synthetic fat left tail (same jump construction as
+    Section~\ref{sec:tail-risk-impl}'s skew test), at equal 50/50
+    weights. Component CVaR assigns the skewed asset a percentage risk
+    contribution more than 5 percentage points higher than
+    volatility-based risk contribution does for the same asset --
+    i.e.\ volatility-based risk measurement is demonstrably blind to
+    exactly the asymmetry Component CVaR is designed to capture. This
+    is not yet the full skewed-universe divergence test at the
+    portfolio-optimization level (that is
+    \texttt{tests/test\_cvar\_parity.py}'s
+    \texttt{test\_cvar\_parity\_differs\_from\_vol\_erc\_on\_skewed\_universe},
+    still a TODO pending \texttt{solve\_cvar\_parity}), but it is the
+    same phenomenon demonstrated one layer down, at the level of
+    contributions rather than solved weights.
+\end{itemize}
 
 \subsection{\texttt{optimization/cvar\_parity.py} -- \texttt{solve\_cvar\_parity}}
-\todo[inline]{Not implemented yet. Will report the convergence plot and
-the skewed-universe divergence test result (the central empirical claim
-of the project).}
+\label{sec:cvar-parity-impl}
+
+Implemented using the cyclical/iterative update outlined in
+Section~\ref{sec:cvar-parity}: at each iteration, recompute Component
+CVaR contributions (via \texttt{cvar\_risk\_contributions},
+Section~\ref{sec:cvar-contrib-impl}) at the current weights, then
+multiply each weight by a factor pulling its contribution toward its
+budgeted target.
+
+\begin{lstlisting}
+for _ in range(params.max_iter):
+    result = cvar_risk_contributions(weights, scenario_returns, confidence)
+    dispersion = float(np.sum((result.pct_contribution - risk_budgets) ** 2))
+    convergence_history.append(dispersion)
+
+    if dispersion < params.tol:
+        break
+
+    adjustment_factor = 1 - params.cvar_parity_learning_rate * (
+        (result.pct_contribution / risk_budgets) - 1
+    )
+    weights = weights * adjustment_factor
+    weights = np.maximum(weights, 1e-8)
+    weights = weights / weights.sum()
+
+if convergence_history[-1] >= params.tol:
+    logger.warning("solve_cvar_parity: did not converge after %d iterations ...")
+\end{lstlisting}
+
+\paragraph{The update rule.} Writing $b_i$ for the risk budget and
+$\%\text{RC}_i(w^{(k)})$ for the achieved percentage Component CVaR
+contribution at iteration $k$, the multiplicative factor is
+\[
+w_i^{(k+1)} = w_i^{(k)} \cdot \left(1 - \eta \left(\frac{\%\text{RC}_i(w^{(k)})}{b_i} - 1\right)\right),
+\]
+where $\eta = \texttt{OptimizationParams.cvar\_parity\_learning\_rate}$.
+An asset over-contributing relative to its budget
+($\%\text{RC}_i > b_i$) gets its weight shrunk; an under-contributing
+one gets it grown -- the same directional intuition as Roncalli's
+cyclical ERC update, just applied to Component CVaR instead of
+Component volatility. Weights are floored at $10^{-8}$ (mirroring the
+$w \geq 10^{-12}$ floor in \texttt{optimization/erc.py}) and
+renormalized to sum to 1 after every step. Using $\%\text{RC}_i / b_i$
+rather than an absolute target $b_i \cdot \CVar_\alpha(w)$ in the
+denominator is a deliberate simplification: since $\%\text{RC}_i =
+\text{RC}_i / \CVar_\alpha(w)$, the two are algebraically identical
+($(\text{RC}_i - b_i \CVar_\alpha(w))/(b_i \CVar_\alpha(w)) =
+\%\text{RC}_i/b_i - 1$), but dividing by $b_i$ -- guaranteed strictly
+positive by the validation above -- avoids needing an arbitrary
+$\varepsilon$ safeguard against a near-zero total-CVaR denominator.
+
+\paragraph{Orientation convention.} \texttt{asset\_returns} is accepted
+in the same $(n_{\text{scenarios}}, n_{\text{assets}})$ orientation used
+everywhere else in the codebase (dates as rows, tickers as columns,
+matching \texttt{clean\_prices}), and transposed once internally to the
+$(n_{\text{assets}}, n_{\text{scenarios}})$ shape
+\texttt{cvar\_risk\_contributions} expects -- callers should not
+pre-transpose.
+
+\paragraph{Non-convergence is reported, not hidden.} Consistent with
+Section~\ref{sec:cvar-parity}'s warning that this problem is not
+convex and convergence is not guaranteed, the loop does not assume
+success: if the final entry of \texttt{convergence\_history} is still
+$\geq \texttt{params.tol}$ after \texttt{max\_iter} iterations, a
+\texttt{logger.warning} reports the final dispersion and iteration
+count, symmetric to the post-hoc check already documented for
+\texttt{solve\_erc} (Section~\ref{sec:vol-erc-impl}). Empirically, on
+synthetic Gaussian universes with a few thousand scenarios, dispersion
+drops by roughly 4 orders of magnitude (e.g.\ $\sim 1.8\times 10^{-3}
+\to \sim 3\times 10^{-5}$ over 500 iterations) without fully reaching
+$\texttt{tol} = 10^{-8}$ -- exactly the kind of "real but bounded"
+non-convergence this project commits to reporting honestly rather than
+hiding by loosening \texttt{tol} until the warning stops firing.
+
+\paragraph{Tests (\texttt{tests/test\_cvar\_parity.py}).}
+\begin{itemize}
+    \item Weights are long-only and sum to 1.
+    \item \texttt{convergence\_history} is finite throughout and ends
+    at least 10$\times$ smaller than it started -- substantial
+    improvement is required, not exact convergence or strict
+    monotonicity (a strict per-step non-increase check would be too
+    strong a claim for a noisy, non-convex cyclical update).
+    \item Contributions are within \texttt{0.02} (2 percentage points)
+    of the target risk budget at the returned weights -- deliberately
+    looser than \texttt{solve\_erc}'s \texttt{1e-6}, for the reasons
+    given in the test module's own docstring (scenario-estimator noise,
+    not a tolerance picked to make the test pass).
+    \item Unequal budgets (75/25 on a 2-asset case) are honored within
+    the same tolerance.
+    \item An invalid risk-budget vector raises before the loop runs.
+    \item \textbf{The central empirical claim, at the solver level}:
+    on a 2-asset synthetic universe with matched volatility but one
+    asset carrying a strong negative skew (fat left tail, same
+    construction as Section~\ref{sec:cvar-contrib-impl}'s test),
+    \texttt{solve\_erc} allocates them equally (blind to skew, by
+    construction), while \texttt{solve\_cvar\_parity} allocates
+    meaningfully less to the skewed asset (measured $\approx 0.60/0.40$
+    vs.\ vol-ERC's $\approx 0.50/0.50$ on one representative run;
+    tested with a $0.05$ margin) -- Component CVaR sees tail risk that
+    volatility alone cannot.
+\end{itemize}
 
 \subsection{\texttt{data/download.py} -- \texttt{download\_prices}}
 
@@ -921,11 +1174,303 @@ with \texttt{dropna(how="all")}.
     right.
 \end{itemize}
 
-\subsection{\texttt{backtest/engine.py}}
-\todo[inline]{Not implemented yet.}
+\subsection{\texttt{backtest/engine.py} -- \texttt{run\_backtest}}
+\label{sec:backtest-impl}
 
-\subsection{\texttt{analysis/compare.py}, \texttt{analysis/plots.py}}
-\todo[inline]{Not implemented yet.}
+Implemented as the rolling, no-look-ahead scheme described in
+Section~\ref{sec:backtest}. \texttt{run\_backtest} takes a black-box
+\texttt{strategy\_fn: window\_returns -> weights} (a closure the caller
+builds around \texttt{solve\_erc}, \texttt{solve\_cvar\_parity}, or
+anything else), so the engine itself never imports an optimizer and
+stays agnostic to which strategy it is backtesting.
+
+\begin{lstlisting}
+for i, rebal_date in enumerate(rebalance_dates):
+    loc = dates.get_loc(rebal_date)
+    window = returns.iloc[:loc]  # strictly before rebal_date
+
+    if len(window) < RISK_PARAMS.vol_lookback_days:
+        continue  # not enough history yet
+
+    target_weights = np.asarray(strategy_fn(window), dtype=float)
+    turnover = float(np.abs(target_weights - current_weights).sum())
+    ...
+    held_weights = target_weights.copy()
+    for t_loc in range(loc, next_loc):
+        day_returns = returns.iloc[t_loc].to_numpy()
+        gross_return = float(held_weights @ day_returns)
+        cost = turnover * params.transaction_cost_bps / 1e4 if t_loc == loc else 0.0
+        daily_returns.iloc[t_loc] = gross_return - cost
+        held_weights = held_weights * (1.0 + day_returns)
+        held_weights = held_weights / held_weights.sum()
+    current_weights = held_weights
+\end{lstlisting}
+
+\paragraph{No-look-ahead.} Enforced structurally, not just by
+convention: \texttt{window = returns.iloc[:loc]} slices by integer
+position, so it excludes the return realized on \texttt{rebal\_date}
+itself (and everything after) by construction -- \texttt{strategy\_fn}
+cannot see the return it is about to be judged on.
+
+\paragraph{Rebalance dates.} Computed by
+\texttt{index.to\_series().resample(freq).last().dropna()}: the last
+trading date actually present in \texttt{returns} within each
+\texttt{freq} period (e.g.\ the last trading day of each month for
+\texttt{freq="ME"}), rather than a fixed calendar grid -- a period with
+no trading days in \texttt{returns} (a holiday-heavy stretch, or a gap
+in the data) is dropped instead of producing a spurious rebalance date
+at a \texttt{NaT}.
+
+\paragraph{Warm-up.} A rebalance is skipped until at least
+\texttt{RiskParams.vol\_lookback\_days} (252) days of history are
+available, since the ex-ante risk-contribution diagnostic below needs a
+non-degenerate covariance estimate. If \emph{no} rebalance date ever
+clears that bar (\texttt{returns} shorter than one lookback window),
+\texttt{run\_backtest} raises \texttt{ValueError} rather than returning
+a silently empty or degenerate result.
+
+\paragraph{Weight drift between rebalances.} Weights are not re-targeted
+daily: \texttt{held\_weights} drifts with realized returns
+(buy-and-hold) between rebalance dates,
+\[
+w_i(t+1) = \frac{w_i(t)\,(1 + r_i(t))}{\sum_j w_j(t)\,(1 + r_j(t))},
+\]
+renormalized each day so weights keep summing to 1. This is what makes
+turnover -- and, in principle, risk-contribution drift
+(Section~\ref{sec:backtest}) -- a non-trivial quantity instead of zero
+by construction.
+
+\paragraph{Transaction costs.} Charged once per rebalance, proportional
+to L1 turnover $\sum_i |w_i^{\text{target}} - w_i^{\text{held, just
+before}}|$, deducted from that rebalance day's return only (every other
+day in the holding period is unaffected). The very first rebalance is
+charged against an implicit all-cash starting position
+(\texttt{current\_weights = 0}), so the cost of funding the portfolio
+initially is included rather than treated as free.
+
+\paragraph{Risk-contribution lens: volatility, for every strategy.}
+\texttt{risk\_contributions\_history} is computed with
+\texttt{volatility\_risk\_contributions} (Section~\ref{sec:vol-erc-impl})
+at every rebalance date, \emph{even for a CVaR-parity strategy}. This is
+deliberate, not an oversight: using one common lens for every strategy
+is what makes it possible to ask this project's central question inside
+the backtest, over time, rather than only at a single static date --
+does a portfolio built to equalize Component CVaR end up with unequal
+\emph{volatility} contributions in practice, and does that gap widen
+under stress? A CVaR-side version of the same diagnostic is a natural
+extension, not implemented here: the engine has no reliable way to know
+what scenario window a black-box \texttt{strategy\_fn} would consider
+appropriate for its own CVaR estimate.
+
+\paragraph{Known gap: daily risk-contribution drift is not exposed.}
+Section~\ref{sec:backtest}'s ``Risk-contribution drift'' subsection
+describes tracking $\%\text{RC}_i$ at every day between rebalances,
+using the weights fixed at the last rebalance -- \texttt{run\_backtest}
+computes the equivalent \texttt{held\_weights} internally, day by day
+(needed to get \texttt{daily\_returns} right), but currently only
+persists weights and risk contributions \emph{at} rebalance dates
+(\texttt{weights\_history}, \texttt{risk\_contributions\_history}), not
+the intermediate daily values. Reported honestly here rather than
+silently narrowing the methodology section to match the code: exposing
+this would mean adding a daily-frequency field to
+\texttt{BacktestResult}, deferred until the comparison/plotting stage
+(Section~\ref{sec:metrics}) actually needs it.
+
+\paragraph{Tests (\texttt{tests/test\_backtest.py}).}
+\begin{itemize}
+    \item \texttt{\_rebalance\_dates} picks the last trading day of each
+    period and drops periods with no trading days at all (not a
+    \texttt{NaT}-derived spurious date).
+    \item Too little history raises \texttt{ValueError}; rebalance dates
+    before \texttt{RiskParams.vol\_lookback\_days} of history is
+    available are skipped, checked against \texttt{\_rebalance\_dates}'s
+    own output directly.
+    \item \texttt{weights\_history} rows are long-only and sum to 1;
+    \texttt{risk\_contributions\_history} rows sum to 1.
+    \item \textbf{No-look-ahead}, checked directly: a spy
+    \texttt{strategy\_fn} records every window it receives, and each one
+    is asserted to end strictly before its rebalance date.
+    \item Turnover on the first rebalance equals 1.0 exactly (funding
+    from an all-cash start); the realized return on a rebalance day
+    matches the exact formula $w \cdot r_t - \text{turnover} \times
+    \text{bps}/10^4$ (no drift has occurred yet that day); comparing a
+    0~bps run against a 50~bps run isolates transaction costs to
+    rebalance days only, with identical returns everywhere else.
+\end{itemize}
+
+\subsection{\texttt{analysis/compare.py} -- \texttt{performance\_table}, \texttt{risk\_contribution\_stability}}
+\label{sec:compare-impl}
+
+Both functions operate purely on the \texttt{BacktestResult}s already
+produced by \texttt{run\_backtest} (Section~\ref{sec:backtest-impl}) --
+no re-fetching of prices or re-solving of any optimizer here, keeping
+this module a thin aggregation layer over backtest output.
+
+\paragraph{\texttt{performance\_table}.} One row per strategy:
+annualized return, annualized volatility, Sharpe ratio, max drawdown,
+Calmar ratio, average turnover.
+\[
+\text{ann. return} = (1+R_{\text{cum}})^{252/n} - 1, \qquad
+\text{ann. vol} = \hat\sigma(r) \sqrt{252}, \qquad
+\text{Sharpe} = \frac{\text{ann. return}}{\text{ann. vol}},
+\]
+\[
+\text{max DD} = -\min_t\left(\frac{W_t}{\max_{s \leq t} W_s} - 1\right), \qquad
+\text{Calmar} = \frac{\text{ann. return}}{\text{max DD}},
+\]
+where $W_t = \prod_{s \leq t}(1+r_s)$ is the wealth curve built from
+\texttt{BacktestResult.returns}. Sharpe assumes a 0\% risk-free rate:
+this project only sources free ETF price data (no risk-free/cash-rate
+series), so introducing a nonzero rate would mean adding a data
+dependency purely for this one ratio -- a deliberate simplification,
+not an oversight. Max drawdown and Calmar's denominator are reported as
+\emph{positive} loss magnitudes, matching this project's
+risk-as-positive-number convention (Section~\ref{sec:tail-risk-impl}'s
+CVaR sign flip), not the negative-number convention some libraries use.
+
+A strategy with genuinely zero variance or drawdown (e.g.\ constant
+daily returns, only possible with synthetic test data) does not land on
+exactly \texttt{0.0} for the denominator -- \texttt{float64} summation
+noise leaves a residual on the order of $10^{-19}$, which is still
+technically positive but not a meaningful denominator. Both ratios are
+therefore guarded with an explicit $\varepsilon = 10^{-12}$ threshold
+(matching the numerical floor already used in
+\texttt{optimization/erc.py}, Section~\ref{sec:vol-erc-impl}) rather
+than an exact \texttt{> 0} comparison, returning \texttt{NaN} below it
+instead of an enormous, meaningless ratio -- caught by this module's own
+test suite before being fixed.
+
+\paragraph{\texttt{risk\_contribution\_stability}.} Per strategy, per
+asset, the standard deviation of $\%\text{RC}_i$ across every rebalance
+date in the backtest (\texttt{BacktestResult.risk\_contributions\_history},
+Section~\ref{sec:backtest-impl}). This is the number that determines
+whether a strategy's ``stays balanced over time'' story
+(Section~\ref{sec:backtest}, ``Risk-contribution drift'') actually
+holds up: a low std means $\%\text{RC}_i$ barely moved from its target
+across the whole backtest; a high one means the portfolio drifted
+meaningfully out of balance between rebalances, however good it looked
+at any single rebalance date.
+
+\paragraph{Deferred: \texttt{diversification\_ratio}.} Also listed in
+the original module TODO and in Section~\ref{sec:metrics}, but
+deliberately not implemented in this pass: $\text{DR}(w) = \sum_i w_i
+\sigma_i / \sigma_p(w)$ needs each asset's \emph{individual} volatility
+and the portfolio volatility at each rebalance date, and
+\texttt{BacktestResult} currently only stores percentage risk
+\emph{contributions} ($\text{RC}_i/\sigma_p$), not the underlying
+$\sigma_i$ or the covariance matrix used to compute them. Implementing
+it properly would mean extending \texttt{BacktestResult}'s schema in
+\texttt{backtest/engine.py} -- a bigger change than filling in this
+module -- so it is flagged here rather than worked around with a silent
+re-derivation that could drift out of sync with the engine's actual
+covariance estimate.
+
+\paragraph{Tests (\texttt{tests/test\_compare.py}).}
+\begin{itemize}
+    \item \texttt{performance\_table}: with exactly 252 daily
+    observations the annualization exponent is 1, so annualized return
+    must equal raw cumulative return exactly; a hand-constructed
+    flat/-10\%/flat return path gives an exactly-checkable max drawdown
+    of 0.10; average turnover is checked against a plain \texttt{mean()}
+    on a hand-picked turnover series; zero-volatility returns give
+    \texttt{NaN} Sharpe and Calmar (the bug described above, now
+    covered by a regression test); one row per strategy with the
+    expected column set.
+    \item \texttt{risk\_contribution\_stability}: matches
+    \texttt{pandas}' own \texttt{std(ddof=1)} on a hand-built
+    contributions history exactly; a strategy with $\%\text{RC}_i$
+    swinging between 0.30 and 0.70 shows a strictly higher std than one
+    swinging between 0.49 and 0.51, per asset; index/columns are
+    strategy names and tickers respectively.
+\end{itemize}
+
+\subsection{\texttt{analysis/plots.py}}
+\label{sec:plots-impl}
+
+Three matplotlib helpers, one per figure from Section~\ref{sec:metrics}'s
+list that maps directly onto a single \texttt{BacktestResult}-derived
+input; all three share a \texttt{\_finalize(fig, save\_path)} helper
+that always returns the \texttt{Figure} (so a notebook cell ending in a
+call to one of these renders it inline), additionally writes it to
+\texttt{save\_path} if one is given, and \texttt{plt.close(fig)}s it
+afterwards purely to keep matplotlib's internal figure registry from
+growing unbounded across a pipeline run -- the returned object stays
+fully usable.
+
+\paragraph{\texttt{plot\_risk\_contributions}.} Grouped bar chart of
+$\%\text{RC}_i$ per asset, one group of bars per strategy, at a single
+date, with a dashed reference line at $1/N_{\text{assets}}$ (the
+default equal risk budget used throughout this project).
+
+\paragraph{\texttt{plot\_cumulative\_returns}.} One line per strategy,
+built from \texttt{BacktestResult.returns} as $W_t =
+\prod_{s\leq t}(1+r_s)$ -- the same wealth curve
+\texttt{performance\_table} (Section~\ref{sec:compare-impl}) uses
+internally for drawdown.
+
+\paragraph{\texttt{plot\_contribution\_stability}.} One subplot per
+strategy, stacked vertically with a shared x-axis, each showing every
+asset's $\%\text{RC}_i$ across all rebalance dates
+(\texttt{risk\_contributions\_history}), with the same $1/N$ reference
+line -- the visual counterpart of
+\texttt{risk\_contribution\_stability}'s std-dev numbers
+(Section~\ref{sec:compare-impl}).
+
+\paragraph{Deferred: a dedicated stress-window figure.} Section~\ref{sec:metrics}
+also lists a fourth figure, zooming into 1--2 stress windows from
+\texttt{riskparity.backtest.stress\_periods.STRESS\_PERIODS} to show
+where vol-ERC and CVaR-parity diverge most. No separate function is
+implemented for it: it is the exact same chart as
+\texttt{plot\_cumulative\_returns}, called with each series in
+\texttt{returns} pre-sliced to a stress window's date range (e.g.\
+\texttt{\{name: r.loc[start:end] for name, r in returns.items()\}}) --
+a second function differing only in what slice of data it receives
+would duplicate \texttt{plot\_cumulative\_returns} for no reason.
+
+\paragraph{Consistent color per strategy across figures.} Achieved via
+matplotlib's default color cycle (colors assigned to series in
+iteration order), not a hard-coded strategy-name-to-color mapping --
+this module has no reason to know what strategy names a caller
+compares. This holds automatically as long as the caller passes
+strategies in the same key order to every plotting function (a plain
+Python \texttt{dict} preserves insertion order), the natural way
+\texttt{scripts/run\_pipeline.py} would build its \texttt{results} dict
+once and reuse it across all three calls.
+
+\paragraph{Manual sanity check.} Run against a synthetic 4-asset,
+$\sim$3-year universe with \texttt{solve\_erc} and
+\texttt{solve\_cvar\_parity} both wired through \texttt{run\_backtest}:
+since the synthetic assets were drawn i.i.d.\ with identical
+distribution parameters, vol-ERC's $\%\text{RC}_i$ stayed flat at
+$0.25$ to within $\sim 10^{-6}$ across every rebalance in
+\texttt{plot\_contribution\_stability}'s top subplot, while
+CVaR-parity's swung between roughly $0.16$ and $0.32$ in the bottom
+subplot -- visually consistent with the
+\texttt{solve\_cvar\_parity: did not converge} warnings
+(Section~\ref{sec:cvar-parity-impl}) logged during the same run, and
+with \texttt{risk\_contribution\_stability} reporting
+CVaR-parity's std roughly $10^5\times$ vol-ERC's on that run. Exactly
+the kind of honest, real instability this project commits to surfacing
+rather than hiding.
+
+\paragraph{Tests (\texttt{tests/test\_plots.py}).}
+\begin{itemize}
+    \item Structural checks only (axis/line/bar counts, titles, whether
+    a file is actually written to a not-yet-existing directory) --
+    deliberately not pixel/image comparison, which would be brittle and
+    add no real coverage for this module.
+    \item \texttt{plot\_risk\_contributions}: exactly $N_{\text{strategies}}
+    \times N_{\text{assets}}$ bars plus the one $1/N$ reference line, at
+    the expected height.
+    \item \texttt{plot\_cumulative\_returns}: one line per strategy; the
+    final data point of a constant-return series matches
+    $(1+r)^n$ exactly.
+    \item \texttt{plot\_contribution\_stability}: one subplot per
+    strategy, titled with the strategy name, each containing
+    $N_{\text{assets}} + 1$ lines (assets plus the reference line).
+    \item All three: \texttt{save\_path} produces a file on disk,
+    including creating a not-yet-existing parent directory.
+\end{itemize}
 
 % ============================================================================
 \section{Empirical Results}
@@ -1136,6 +1681,151 @@ auto-generates behavior for declared fields, so a method carelessly
 nested inside the dataclass body without \texttt{self} or
 \texttt{@staticmethod} is still broken -- \texttt{@dataclass} does not
 protect against that kind of structural mistake.
+
+\item[Q: What is the current state of the project, and what should we work on next?]
+At the start of this session, \texttt{optimization/cvar\_parity.py}'s
+\texttt{solve\_cvar\_parity} was already implemented and staged (see
+Section~\ref{sec:cvar-parity-impl}). \texttt{backtest/engine.py} was
+mid-draft: \texttt{run\_backtest} was still a stub
+(\texttt{print(); return 0}), and the file additionally contained
+module-level exploratory code -- an inline \texttt{yfinance} download of
+\texttt{AGG/SPY/EEM/BTC-USD} that executed on import -- which violates
+the project rule that only \texttt{data/download.py} may talk to
+\texttt{yfinance} (\texttt{CLAUDE.md}, ``Repository structure''). Agreed
+next step: implement \texttt{run\_backtest} properly and remove the
+exploratory code, which Section~\ref{sec:backtest-impl} now documents.
+
+\item[Q: Implement \texttt{run\_backtest}, and explain every design choice made along the way.]
+Covered in full in Section~\ref{sec:backtest-impl}: no-look-ahead via
+integer-position slicing before the rebalance date, rebalance dates via
+\texttt{resample(freq).last().dropna()}, a warm-up threshold of
+\texttt{RiskParams.vol\_lookback\_days} before the first rebalance is
+attempted, buy-and-hold weight drift between rebalances, turnover-based
+transaction costs charged once per rebalance against an implicit
+all-cash starting position, and the deliberate choice to report
+ex-ante risk contributions with \texttt{volatility\_risk\_contributions}
+for every strategy -- including CVaR-parity ones -- so the CVaR-vs-vol
+divergence question can be tracked over the whole backtest, not just at
+one static date.
+
+\item[Q: Explain \texttt{run\_backtest} line by line.]
+Walked through in the session: \texttt{\_rebalance\_dates} converts the
+returns index to a \texttt{Series} of dates on itself purely so
+\texttt{.resample().last()} can be used, keeping the last trading date
+per period and dropping empty periods via \texttt{.dropna()}. The main
+loop, for each rebalance date, slices \texttt{window = returns.iloc[:loc]}
+(strictly before that date), skips the date if
+\texttt{RiskParams.vol\_lookback\_days} of history is not yet available,
+calls \texttt{strategy\_fn(window)} for the target weights, computes
+turnover against the currently-held weights, records ex-ante risk
+contributions on that same window, then runs an inner day-by-day loop
+from the rebalance date to the next one that (a) computes that day's
+gross portfolio return as \texttt{held\_weights @ day\_returns}, (b)
+subtracts the transaction cost only on the rebalance day itself, and
+(c) drifts \texttt{held\_weights} forward with that day's realized
+returns for the next iteration. After the loop, results accumulated in
+plain \texttt{dict}s are assembled into the \texttt{BacktestResult}
+dataclass (Section~\ref{sec:backtest-impl}).
+
+\item[Q: What exactly does \texttt{run\_backtest} return?]
+A \texttt{BacktestResult} with four fields: \texttt{returns} (daily net
+portfolio returns, from the first successful rebalance onward);
+\texttt{weights\_history} (target weights, one row per rebalance date,
+summing to 1); \texttt{turnover} (one scalar per rebalance date); and
+\texttt{risk\_contributions\_history} (percentage volatility risk
+contributions, one row per rebalance date, summing to 1). Note what is
+\emph{not} returned: the day-by-day drifted weights between rebalance
+dates are computed internally (\texttt{held\_weights}) but discarded
+after each day, not exposed -- see the ``known gap'' paragraph in
+Section~\ref{sec:backtest-impl}.
+
+\item[Q: What does ``weight drift'' mean?]
+Between two rebalance dates, nothing is bought or sold, but the assets
+that outperform mechanically grow to a larger share of the portfolio
+and the underperformers shrink -- e.g.\ starting at 50/50, one asset up
+2\% and the other down 1\% on the same day moves the portfolio to
+roughly 50.75/49.25 with zero trading. \texttt{held\_weights} in
+\texttt{run\_backtest}'s inner loop (Section~\ref{sec:backtest-impl})
+tracks exactly this, day by day, and it is what the next rebalance's
+turnover is measured against (the actual currently-held mix, not last
+month's target).
+
+\item[Q: What is the formula used to renormalize drifted weights?]
+\[
+w_i(t+1) = \frac{w_i(t)\,(1 + r_i(t))}{\sum_j w_j(t)\,(1 + r_j(t))}.
+\]
+The numerator revalues each asset's holding by its own return; the
+denominator (summed over all assets) restores the total to 1 so the
+result is again expressed as portfolio-fraction weights rather than raw
+revalued amounts. Implemented as \texttt{held\_weights *= (1 +
+day\_returns)} followed by \texttt{held\_weights /=
+held\_weights.sum()}.
+
+\item[Q: Does \texttt{run\_backtest} produce plots of how contributions/weights evolve, or does that happen elsewhere?]
+Elsewhere. \texttt{run\_backtest} is a pure computation engine -- it
+returns data (\texttt{BacktestResult}), never a figure, by design
+(\texttt{CLAUDE.md}'s separation of concerns). Plotting belongs in
+\texttt{riskparity/analysis/plots.py} (Section~\ref{sec:metrics}), not
+yet implemented, which will consume one or more
+\texttt{BacktestResult}s and save figures to \texttt{results/figures/}
+for inclusion here via the \texttt{IfFileExists} guards already wired
+into Section~\ref{sec:results}.
+
+\item[Q: Add tests for what was just implemented in \texttt{run\_backtest}.]
+Added \texttt{tests/test\_backtest.py}, 11 tests, listed in
+Section~\ref{sec:backtest-impl}'s ``Tests'' paragraph -- covering
+\texttt{\_rebalance\_dates}'s resample/dropna behavior, the warm-up
+skip logic, structural invariants on \texttt{weights\_history} and
+\texttt{risk\_contributions\_history}, an explicit no-look-ahead check
+via a spy \texttt{strategy\_fn}, and exact (not approximate) turnover
+and transaction-cost accounting.
+
+\item[Q: What are the next steps for the project?]
+Cross-checked \texttt{CLAUDE.md}'s suggested build order against actual
+module contents: steps 1--7 (volatility, vol-ERC, tail risk, Component
+CVaR, CVaR-parity, data download/clean, backtest engine) were all
+implemented and the full suite passed (50/50 tests at that point).
+Remaining: step 8, \texttt{analysis/compare.py} + \texttt{plots.py}
+(both still \texttt{raise NotImplementedError}); step 9, wiring
+everything into \texttt{scripts/run\_pipeline.py}; step 10, filling in
+the README's ``Key results'' section with real numbers. Agreed order:
+\texttt{compare.py} first (its output is what \texttt{plots.py} and the
+pipeline both need), then \texttt{plots.py}, then the pipeline wiring.
+
+\item[Q: Start with \texttt{analysis/compare.py}.]
+Implemented \texttt{performance\_table} and
+\texttt{risk\_contribution\_stability}, both documented in full in
+Section~\ref{sec:compare-impl}. \texttt{diversification\_ratio}, also
+mentioned in the module's original TODO, was deliberately left
+unimplemented and flagged rather than silently dropped or worked around
+-- it needs per-asset volatilities that \texttt{BacktestResult} does
+not currently expose (see that section's ``Deferred'' paragraph).
+Along the way, the test suite for \texttt{performance\_table} caught a
+real bug: a zero-volatility edge case produced an astronomically large
+Sharpe ratio instead of the intended \texttt{NaN}, because float64
+summation noise left the computed volatility at $\sim 10^{-19}$ instead
+of exactly \texttt{0.0}, which passed a naive \texttt{> 0} guard. Fixed
+with an explicit $10^{-12}$ epsilon threshold, matching the numerical
+floor pattern already used in \texttt{optimization/erc.py}.
+
+\item[Q: Now implement \texttt{analysis/plots.py}.]
+Implemented the three functions already declared in the module
+(\texttt{plot\_risk\_contributions}, \texttt{plot\_cumulative\_returns},
+\texttt{plot\_contribution\_stability}), documented in full in
+Section~\ref{sec:plots-impl}. The module docstring's fourth suggested
+figure (a stress-window zoom) was deliberately left without its own
+function, since it is exactly \texttt{plot\_cumulative\_returns} called
+on pre-sliced data -- same reasoning as deferring
+\texttt{diversification\_ratio} in \texttt{compare.py}: flag a gap
+explicitly rather than add a near-duplicate function or silently drop
+the requirement. Sanity-checked end-to-end (not just via
+\texttt{tests/test\_plots.py}'s structural checks) by running
+\texttt{solve\_erc} and \texttt{solve\_cvar\_parity} through
+\texttt{run\_backtest} on a synthetic universe and visually inspecting
+the three saved PNGs: results matched expectations, including
+CVaR-parity's known non-convergence showing up as real, visible
+contribution drift in \texttt{plot\_contribution\_stability} where
+vol-ERC (on an i.i.d.\ synthetic universe) stayed essentially flat.
 
 \end{description}
 

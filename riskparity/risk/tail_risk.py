@@ -78,4 +78,3 @@ def cornish_fisher_cvar(portfolio_returns: pd.Series, confidence: float) -> floa
     # CVaR modifiée
     m_cvar = -(mu + sigma * e_cf)
     return m_cvar
-    

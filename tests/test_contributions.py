@@ -9,7 +9,9 @@ built on, not just "does the code run".
 import numpy as np
 import pytest
 
-from riskparity.risk.contributions import volatility_risk_contributions
+from riskparity.risk.contributions import cvar_risk_contributions, volatility_risk_contributions
+
+CONFIDENCE = 0.975
 
 
 def test_volatility_contributions_sum_to_total_risk():
@@ -58,10 +60,66 @@ def test_volatility_contributions_concentrated_portfolio():
     assert result.total_risk == pytest.approx(np.sqrt(cov[0, 0]), rel=1e-8)
 
 
-# TODO once cvar_risk_contributions is implemented:
-# - test that sum_i RC_i ~= CVaR_alpha(portfolio) within a documented tolerance
-#   (the scenario estimator is NOT exact the way the vol one is -- pick a
-#   tolerance and justify it, don't silently loosen `approx` until it passes)
-# - test on a known fat-tailed synthetic distribution (e.g. Student-t
-#   simulated returns) that CVaR contributions differ meaningfully from
-#   volatility contributions for a skewed asset
+def test_cvar_contributions_sum_to_total_risk():
+    """Euler's identity for CVaR: sum_i RC_i == CVaR_alpha(w). Unlike the
+    module docstring's general "approximately exact" caveat for the
+    scenario estimator, this is exactly exact here because marginal and
+    total_risk are computed from the SAME tail mask -- see the reasoning
+    in cvar_risk_contributions's own docstring.
+    """
+    rng = np.random.default_rng(0)
+    n_assets, n_scenarios = 5, 2000
+    asset_returns = rng.normal(0.0, 0.01, size=(n_assets, n_scenarios))
+    weights = rng.dirichlet(np.ones(n_assets))
+
+    result = cvar_risk_contributions(weights, asset_returns, CONFIDENCE)
+
+    assert result.contribution.sum() == pytest.approx(result.total_risk, rel=1e-8)
+    assert result.pct_contribution.sum() == pytest.approx(1.0, rel=1e-8)
+
+
+def test_cvar_contributions_concentrated_portfolio():
+    """A 100%-in-one-asset portfolio has all CVaR contribution on that
+    asset and zero elsewhere -- same edge case already checked for
+    volatility_risk_contributions above.
+    """
+    rng = np.random.default_rng(1)
+    asset_returns = rng.normal(0.0, 0.01, size=(2, 1000))
+    weights = np.array([1.0, 0.0])
+
+    result = cvar_risk_contributions(weights, asset_returns, CONFIDENCE)
+
+    assert result.contribution[1] == pytest.approx(0.0, abs=1e-12)
+    assert result.total_risk == pytest.approx(result.contribution[0], rel=1e-8)
+
+
+def test_cvar_contributions_differ_from_volatility_on_skewed_asset():
+    """Central empirical claim of the project: an asset with a fat left
+    tail (strong negative skew) but similar overall volatility to a
+    symmetric asset should be assigned a LARGER share of risk by
+    Component CVaR than by volatility-based risk contribution, since
+    volatility alone cannot see the asymmetry.
+    """
+    rng = np.random.default_rng(2)
+    n = 8000
+
+    symmetric = rng.normal(0.0005, 0.010, size=n)
+    # Skewed asset: same rough vol scale as `symmetric`, but with a fat
+    # left tail from occasional large negative jumps (same construction
+    # as tests/test_tail_risk.py's negative-skew test).
+    normal_part = rng.normal(0.0013, 0.0085, size=n)
+    jump_mask = rng.random(n) < 0.03
+    jumps = np.where(jump_mask, rng.normal(-0.04, 0.01, size=n), 0.0)
+    skewed = normal_part + jumps
+
+    asset_returns = np.vstack([symmetric, skewed])
+    weights = np.array([0.5, 0.5])
+
+    cov = np.cov(asset_returns)
+    vol_result = volatility_risk_contributions(weights, cov)
+    cvar_result = cvar_risk_contributions(weights, asset_returns, CONFIDENCE)
+
+    skewed_pct_rc_vol = vol_result.pct_contribution[1]
+    skewed_pct_rc_cvar = cvar_result.pct_contribution[1]
+
+    assert skewed_pct_rc_cvar > skewed_pct_rc_vol + 0.05
